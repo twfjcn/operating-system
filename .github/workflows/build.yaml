@@ -34,7 +34,7 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
-  BUILD_TIMEOUT_MINUTES: 180  # 构建超时保护
+  BUILD_TIMEOUT_MINUTES: 180  # 新增：构建超时保护
 
 jobs:
   prepare:
@@ -44,7 +44,7 @@ jobs:
       contents: read
       pull-requests: read
       packages: write
-      id-token: write  # 增强GHCR认证权限
+      id-token: write  # 新增：增强GHCR认证权限
     outputs:
       version_dev: ${{ steps.version_dev.outputs.version_dev }}
       version_main: ${{ steps.version.outputs.version_main }}
@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          token: ${{ github.token }}  # 显式指定token，兼容未来版本
+          token: ${{ github.token }}  # 新增：显式指定token
 
       - name: Check if build should be published
         id: check_publish
@@ -186,7 +186,7 @@ jobs:
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
             registry: ghcr.io
-            username: ${{ github.actor }}  # 使用actor而非repository_owner，提升兼容性
+            username: ${{ github.actor }}  # 修改：替换为actor提升兼容性
             password: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Build and Push (兼容模式)
@@ -197,9 +197,9 @@ jobs:
           file: Dockerfile
           tags: ghcr.io/${{ github.repository_owner }}/haos-builder
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main mode=max
-          push: ${{ github.repository_owner != 'twfjcn' }}  # 私有仓库跳过推送，避免权限问题
-          load: ${{ github.repository_owner == 'twfjcn' }}   # 本地加载镜像，不推送
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main }},mode=max
+          push: ${{ github.repository_owner != 'twfjcn' }}  # 新增：私有仓库跳过推送
+          load: ${{ github.repository_owner == 'twfjcn' }}   # 新增：本地加载镜像
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -209,7 +209,7 @@ jobs:
         if: env.RAUC_CERTIFICATE == '' || env.RAUC_PRIVATE_KEY == ''
         run: |
           echo "::warning:: RAUC certificate or key is missing in the repository secrets. Building with a public self-signed certificate!"
-          # 容错处理：检查脚本是否存在
+          # 新增：容错处理
           if [ -f "buildroot-external/scripts/generate-signing-key.sh" ]; then
             buildroot-external/scripts/generate-signing-key.sh cert.pem key.pem
             echo "self_signed_cert=true" >> $GITHUB_OUTPUT
@@ -230,14 +230,14 @@ jobs:
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
-      contents: write  # for actions/upload-release-asset to upload release asset
-      packages: read   # 读取构建镜像权限
+      contents: write
+      packages: read  # 新增：读取镜像权限
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     runs-on: ubuntu-22.04
-    timeout-minutes: ${{ env.BUILD_TIMEOUT_MINUTES }}  # 构建超时控制
+    timeout-minutes: ${{ env.BUILD_TIMEOUT_MINUTES }}  # 新增：构建超时控制
 
     steps:
       - name: Checkout source
@@ -245,19 +245,20 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-          token: ${{ github.token }}
+          token: ${{ github.token }}  # 新增：显式指定token
 
       - name: Setup Python version ${{ env.PYTHON_VERSION }}
         if: ${{ github.event_name != 'release' }}
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'  # 缓存Python依赖
+          cache: 'pip'  # 新增：Python依赖缓存
 
       - name: Install AWS CLI
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
         run: |
-          pip install 'awscli<1.37.0' || pip3 install 'awscli<1.37.0'  # 容错处理
+          # 新增：容错处理
+          pip install 'awscli<1.37.0' || pip3 install 'awscli<1.37.0'
 
       - name: Set version suffix
         if: ${{ github.event_name != 'release' }}
@@ -272,6 +273,7 @@ jobs:
           RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
           RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
         run: |
+          # 新增：容错处理
           echo "${RAUC_CERTIFICATE}" > cert.pem || echo "::warning:: Failed to write cert.pem"
           echo "${RAUC_PRIVATE_KEY}" > key.pem || echo "::warning:: Failed to write key.pem"
 
@@ -283,12 +285,12 @@ jobs:
 
       - name: Free space on build drive (增强版)
         run: |
-          # 更彻底的空间清理
+          # 新增：更彻底的空间清理
           df -h
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/graalvm /usr/local/lib/node_modules
           sudo rm -rf /opt/ghc /usr/share/swift /usr/local/.ghcup
           sudo apt-get clean && sudo apt-get autoremove -y
-          # 原有清理逻辑
+          # 原有逻辑
           sudo rm -rf /usr/local/lib/android/sdk/ndk
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo mkdir -p /mnt/cache /mnt/output
@@ -303,7 +305,7 @@ jobs:
         with:
           path: /mnt/cache/cc
           key: haos-cc-${{ matrix.board.id }}
-          restore-keys: |
+          restore-keys: |  # 新增：缓存回退策略
             haos-cc-${{ matrix.board.id }}-
             haos-cc-
 
@@ -341,7 +343,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_OS_ARTIFACTS_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_OS_ARTIFACTS_KEY }}
         run: |
-          # 重试机制 + 容错处理
+          # 新增：重试机制 + 容错
           if [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ]; then
             aws s3 sync \
               ./ \
@@ -368,6 +370,7 @@ jobs:
 
       - name: Print cache stats
         run: |
+          # 新增：容错处理
           echo "Cache size: $(du -sh /mnt/cache/cc || echo "N/A")"
           echo "Files total: $(find /mnt/cache/cc -mindepth 1 -type f | wc -l || echo "0")"
           echo "Old files to remove: $(find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile | wc -l || echo "0")"
@@ -388,7 +391,7 @@ jobs:
           echo "Release channel: ${{ inputs.hassio_channel }} (${{ needs.prepare.outputs.hassio_channel_option }})" >> $GITHUB_STEP_SUMMARY
           echo "| Container | Version |" >> $GITHUB_STEP_SUMMARY
           echo "|:-|:-|" >> $GITHUB_STEP_SUMMARY
-          # 容错处理：避免文件不存在导致失败
+          # 新增：容错处理
           supervisor_version=$(jq -r ".supervisor" output/build/hassio-*/version.json 2>/dev/null || echo "unknown")
           landingpage_version=$(curl -fsSL https://api.github.com/repos/home-assistant/landingpage/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "unknown")
           echo "| supervisor | [${supervisor_version}](https://github.com/home-assistant/supervisor/releases/tag/${supervisor_version}) |" >> $GITHUB_STEP_SUMMARY
@@ -401,7 +404,7 @@ jobs:
           echo "| File | Size (bytes) | Size (formatted) |" >> $GITHUB_STEP_SUMMARY
           echo "|:-|:-|:-|" >> $GITHUB_STEP_SUMMARY
           for f in output/images/haos_*; do
-            if [ -f "$f" ]; then
+            if [ -f "$f" ]; then  # 新增：文件存在性检查
               echo "| $(basename $f) | $(du -b $f | cut -f1) | $(du -bh $f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
             fi
           done
@@ -409,7 +412,7 @@ jobs:
           echo "| File | Size (bytes) | Size (formatted) |" >> $GITHUB_STEP_SUMMARY
           echo "|:-|:-|:-|" >> $GITHUB_STEP_SUMMARY
           for f in boot.vfat kernel.img rootfs.erofs overlay.ext4 data.ext4; do
-            if [ -f "output/images/$f" ]; then
+            if [ -f "output/images/$f" ]; then  # 新增：文件存在性检查
               echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
             fi
           done
@@ -421,7 +424,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-          retention-days: 7  # 避免存储冗余
+          retention-days: 7  # 新增：Artifact保留期
 
       - name: Upload RAUC bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -430,7 +433,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-          retention-days: 7
+          retention-days: 7  # 新增：Artifact保留期
 
       - name: Upload Open Virtualization Format (OVA) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -439,7 +442,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
-          retention-days: 7
+          retention-days: 7  # 新增：Artifact保留期
 
       - name: Upload QEMU disk image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -448,7 +451,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
-          retention-days: 7
+          retention-days: 7  # 新增：Artifact保留期
 
       - name: Upload VMware Virtual Machine Disk (VMDK) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -457,7 +460,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
-          retention-days: 7
+          retention-days: 7  # 新增：Artifact保留期
 
       - name: Upload VirtualBox Virtual Disk Image (VDI) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -466,7 +469,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
-          retention-days: 7
+          retention-days: 7  # 新增：Artifact保留期
 
       - name: Upload Virtual Hard Disk v2 (VHDX) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -475,4 +478,4 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
-          retention-days: 7
+          retention-days: 7  # 新增：Artifact保留期
