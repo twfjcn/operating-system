@@ -1,5 +1,6 @@
-# Home Assistant Operating System build workflow
-name: OS build
+# Home Assistant Operating System Build Workflow
+# Optimized for private repository (twfjcn) - no GHCR push required
+name: HAOS Build
 
 on:
   release:
@@ -7,22 +8,22 @@ on:
   workflow_dispatch:
     inputs:
       boards:
-        description: 'List of boards to build (comma separated identifiers)'
+        description: 'Target boards (comma-separated, e.g. panther-x2,ova)'
         required: false
         type: string
         default: "panther-x2"
       publish:
-        description: 'Publish build artifacts to R2 (not applicable to forks)'
+        description: 'Publish to R2 storage (only for official repo)'
         required: true
         type: boolean
         default: false
       run_tests:
-        description: 'Run tests after build'
+        description: 'Include test builds (adds OVA board)'
         required: true
         type: boolean
         default: false
       hassio_channel:
-        description: 'Release channel to use (default: stable for GH releases, dev otherwise)'
+        description: 'Hass.io release channel'
         type: choice
         required: true
         default: default
@@ -32,352 +33,344 @@ on:
           - beta
           - dev
 
-# 全局环境变量配置
+# Global Configuration
 env:
+  # Core settings
   PYTHON_VERSION: "3.13"
-  BUILD_TIMEOUT_MINUTES: 180
-  GHCR_OWNER: ${{ github.repository_owner }}
-  BUILD_ROOT: ${{ github.workspace }}
-  CACHE_DIR: /mnt/cache
-  OUTPUT_DIR: /mnt/output
+  BUILD_TIMEOUT: 180  # minutes
+  REPO_OWNER: ${{ github.repository_owner }}
+  
+  # Path configuration
+  WORKSPACE: ${{ github.workspace }}
+  CACHE_DIR: /mnt/build-cache
+  OUTPUT_DIR: /mnt/build-output
+  ARTIFACT_RETENTION: 7  # days
+  
+  # Docker settings
+  BUILDER_IMAGE: ghcr.io/${{ github.repository_owner }}/haos-builder:latest
+  DOCKER_BUILDKIT: 1
 
-# 默认运行配置
+# Default execution settings
 defaults:
   run:
     shell: bash
-    working-directory: ${{ env.BUILD_ROOT }}
+    working-directory: ${{ env.WORKSPACE }}
 
 jobs:
-  # 准备阶段：版本处理、镜像构建、证书生成
+  # --------------------------------------------------------------------------
+  # Preparation Stage: Environment setup, versioning, and builder image build
+  # --------------------------------------------------------------------------
   prepare:
-    name: Prepare build environment
+    name: Prepare Build Environment
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      pull-requests: read
-      packages: write
+      packages: write  # Required for public repos only
       id-token: write
     outputs:
-      version_dev: ${{ steps.version_dev.outputs.version_dev }}
-      version_main: ${{ steps.version.outputs.version_main }}
-      version_full: ${{ steps.version.outputs.version_full }}
+      version: ${{ steps.version.outputs.full }}
+      version_main: ${{ steps.version.outputs.main }}
+      version_dev: ${{ steps.version_dev.outputs.suffix }}
       channel: ${{ steps.channel.outputs.channel }}
-      hassio_channel_option: ${{ steps.channel.outputs.hassio_channel_option }}
-      matrix: ${{ steps.generate_matrix.outputs.result }}
-      build_container_image: ${{ steps.export_image.outputs.image_name }}
-      publish_build: ${{ steps.check_publish.outputs.publish_build }}
-      self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
+      hassio_channel: ${{ steps.channel.outputs.hassio }}
+      matrix: ${{ steps.matrix.outputs.config }}
+      publish: ${{ steps.publish_check.outputs.enabled }}
+      self_signed_cert: ${{ steps.certs.outputs.self_signed }}
+      builder_image: ${{ steps.builder.outputs.image }}
     steps:
-      - name: Checkout source code
+      - name: Checkout Source Code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          submodules: recursive
           persist-credentials: false
           token: ${{ github.token }}
-          submodules: recursive
           fetch-depth: 1
 
-      - name: Determine publish status
-        id: check_publish
-        env:
-          PUBLISH_FLAG: ${{ inputs.publish }}
+      - name: Determine Publish Status
+        id: publish_check
         run: |
-          if [ "${{ github.repository }}" == "home-assistant/operating-system" ]; then
-            publish_flag=$([ "$PUBLISH_FLAG" = "true" ] || [ "${{ github.event_name }}" = "release" ] && echo "true" || echo "false")
+          # Only enable publish for official repo
+          if [[ "${{ github.repository }}" == "home-assistant/operating-system" && "${{ inputs.publish }}" == "true" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
-            publish_flag="false"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "publish_build=${publish_flag}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate development version suffix
+      - name: Generate Development Version Suffix
         id: version_dev
         if: ${{ github.event_name != 'release' }}
-        env:
-          PUBLISH_BUILD: ${{ steps.check_publish.outputs.publish_build }}
         run: |
-          base_version="dev$(date --utc +'%Y%m%d')"
-          if [ "$PUBLISH_BUILD" != "true" ] || [ "${{ github.ref }}" != "refs/heads/dev" ]; then
-            version_suffix="${base_version}-$(date +%s)"
-          else
-            version_suffix="${base_version}"
+          # Generate unique dev version suffix
+          BASE_SUFFIX="dev-$(date -u +%Y%m%d)"
+          if [[ "${{ github.ref }}" != "refs/heads/dev" ]]; then
+            BASE_SUFFIX="${BASE_SUFFIX}-$(date +%s)"
           fi
-          echo "Development version suffix: ${version_suffix}"
-          echo "version_dev=${version_suffix}" >> "$GITHUB_OUTPUT"
+          echo "suffix=${BASE_SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "Generated dev suffix: ${BASE_SUFFIX}"
 
-      - name: Update version suffix in meta file
+      - name: Update Version Metadata
         if: ${{ github.event_name != 'release' }}
         env:
-          VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
+          VERSION_SUFFIX: ${{ steps.version_dev.outputs.suffix }}
         run: |
-          META_FILE="${BUILD_ROOT}/buildroot-external/meta"
-          if [ -f "$META_FILE" ]; then
-            sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" "$META_FILE"
-            echo "Updated version suffix to: ${VERSION_DEV}"
-          else
-            echo "::warning:: Meta file not found at ${META_FILE}"
+          META_FILE="${WORKSPACE}/buildroot-external/meta"
+          
+          # Create meta file if missing
+          if [[ ! -f "$META_FILE" ]]; then
+            echo "::warning:: Creating default meta file"
+            echo -e "VERSION_MAJOR=12\nVERSION_MINOR=0\nVERSION_SUFFIX=\"\"" > "$META_FILE"
           fi
+          
+          # Update version suffix
+          sed -i -E "s/(^VERSION_SUFFIX=).*/\1\"${VERSION_SUFFIX}\"/" "$META_FILE"
+          cat "$META_FILE" | grep VERSION
 
-      - name: Extract version information
+      - name: Extract Version Information
         id: version
         run: |
-          META_FILE="${BUILD_ROOT}/buildroot-external/meta"
-          if [ ! -f "$META_FILE" ]; then
-            echo "::error:: Meta file missing at ${META_FILE}"
+          # Load version metadata
+          source "${WORKSPACE}/buildroot-external/meta"
+          
+          # Validate version components
+          if [[ -z "${VERSION_MAJOR}" || -z "${VERSION_MINOR}" ]]; then
+            echo "::error:: Missing version information in meta file"
             exit 1
           fi
           
-          # Source the meta file safely
-          source "$META_FILE"
-          
-          # Validate required variables
-          if [ -z "${VERSION_MAJOR}" ] || [ -z "${VERSION_MINOR}" ]; then
-            echo "::error:: VERSION_MAJOR/MINOR not found in meta file"
-            exit 1
-          fi
-          
+          # Build version strings
           VERSION_MAIN="${VERSION_MAJOR}.${VERSION_MINOR}"
-          VERSION_FULL="${VERSION_MAIN}${VERSION_SUFFIX:+.${VERSION_SUFFIX}}"
+          VERSION_FULL="${VERSION_MAIN}${VERSION_SUFFIX:+.${VERSION_SUFFIX//\"/}}"
           
-          echo "version_main=${VERSION_MAIN}" >> "$GITHUB_OUTPUT"
-          echo "version_full=${VERSION_FULL}" >> "$GITHUB_OUTPUT"
+          echo "main=${VERSION_MAIN}" >> "$GITHUB_OUTPUT"
+          echo "full=${VERSION_FULL}" >> "$GITHUB_OUTPUT"
           echo "Extracted version: ${VERSION_FULL}"
 
-      - name: Validate release version
-        id: version_check
+      - name: Validate Release Version
         if: ${{ github.event_name == 'release' }}
         run: |
           RELEASE_TAG="${{ github.event.release.tag_name }}"
-          BUILD_VERSION="${{ steps.version.outputs.version_full }}"
+          BUILD_VERSION="${{ steps.version.outputs.full }}"
           
-          if [ "$BUILD_VERSION" != "$RELEASE_TAG" ]; then
+          if [[ "${BUILD_VERSION}" != "${RELEASE_TAG}" ]]; then
             echo "::error:: Version mismatch! Build: ${BUILD_VERSION}, Release: ${RELEASE_TAG}"
             exit 1
           fi
-          echo "Version validation passed: ${BUILD_VERSION}"
 
-      - name: Determine build channel
+      - name: Determine Build Channels
         id: channel
         run: |
-          # Determine base channel
-          if [ "${{ github.event_name }}" = "release" ]; then
-            BASE_CHANNEL=$([ "${{ github.event.release.prerelease }}" = "true" ] && echo "beta" || echo "stable")
+          # Base channel (stable/beta/dev)
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            BASE_CHANNEL=$([ "${{ github.event.release.prerelease }}" == "true" ] && echo "beta" || echo "stable")
           else
             BASE_CHANNEL="dev"
           fi
           
-          # Determine hassio channel
+          # Hass.io channel mapping
           INPUT_CHANNEL="${{ inputs.hassio_channel }}"
-          if [ "$INPUT_CHANNEL" = "default" ]; then
-            HASSIO_CHANNEL=$([ "$BASE_CHANNEL" = "stable" ] && echo "BR2_PACKAGE_HASSIO_CHANNEL_STABLE" || echo "BR2_PACKAGE_HASSIO_CHANNEL_DEV")
+          if [[ "${INPUT_CHANNEL}" == "default" ]]; then
+            HASSIO_CHANNEL=$([ "${BASE_CHANNEL}" == "stable" ] && echo "BR2_PACKAGE_HASSIO_CHANNEL_STABLE" || echo "BR2_PACKAGE_HASSIO_CHANNEL_DEV")
           else
-            case $INPUT_CHANNEL in
+            case "${INPUT_CHANNEL}" in
               stable) HASSIO_CHANNEL="BR2_PACKAGE_HASSIO_CHANNEL_STABLE" ;;
               beta) HASSIO_CHANNEL="BR2_PACKAGE_HASSIO_CHANNEL_BETA" ;;
               dev) HASSIO_CHANNEL="BR2_PACKAGE_HASSIO_CHANNEL_DEV" ;;
               *) 
-                echo "::warning:: Invalid channel '${INPUT_CHANNEL}', falling back to dev"
+                echo "::warning:: Invalid channel '${INPUT_CHANNEL}', using dev"
                 HASSIO_CHANNEL="BR2_PACKAGE_HASSIO_CHANNEL_DEV"
                 ;;
             esac
           fi
           
           echo "channel=${BASE_CHANNEL}" >> "$GITHUB_OUTPUT"
-          echo "hassio_channel_option=${HASSIO_CHANNEL}" >> "$GITHUB_OUTPUT"
-          echo "Build channel: ${BASE_CHANNEL}, Hass.io channel: ${HASSIO_CHANNEL}"
+          echo "hassio=${HASSIO_CHANNEL}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate build matrix
-        id: generate_matrix
+      - name: Generate Build Matrix
+        id: matrix
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             try {
-              // Load board matrix
-              const matrixPath = './.github/workflows/matrix.json';
-              const boards = require(matrixPath);
+              // Load board configuration
+              const matrixFile = require('./.github/workflows/matrix.json');
+              const allBoards = Array.isArray(matrixFile) ? matrixFile : matrixFile.boards;
               
               // Determine target boards
+              const isRelease = '${{ github.event_name }}' === 'release';
+              const inputBoards = '${{ inputs.boards }}'.trim().split(',').filter(b => b);
+              const includeTests = '${{ inputs.run_tests }}' === 'true';
+              
               let targetBoards = [];
-              const isRelease = "${{ github.event_name }}" === "release";
-              const boardFilter = "${{ github.event.inputs.boards }}".trim();
-              const runTests = "${{ github.event.inputs.run_tests }}" === "true";
               
               if (isRelease) {
                 // Build all boards for release
-                targetBoards = boards;
-              } else if (boardFilter) {
-                // Build filtered boards for manual run
-                const boardSet = new Set(boardFilter.split(',').map(b => b.trim()));
-                targetBoards = boards.filter(b => boardSet.has(b.id));
+                targetBoards = allBoards;
+              } else if (inputBoards.length > 0) {
+                // Filter boards from input
+                targetBoards = allBoards.filter(b => inputBoards.includes(b.id));
                 
-                // Add OVA board if tests are enabled
-                if (runTests && !boardSet.has('ova')) {
-                  const ovaBoard = boards.find(b => b.id === 'ova');
+                // Add OVA board for testing if needed
+                if (includeTests && !inputBoards.includes('ova')) {
+                  const ovaBoard = allBoards.find(b => b.id === 'ova');
                   if (ovaBoard) targetBoards.push(ovaBoard);
                 }
               } else {
                 // Default to panther-x2
-                targetBoards = boards.filter(b => b.id === 'panther-x2');
+                targetBoards = allBoards.filter(b => b.id === 'panther-x2');
               }
               
-              // Validate matrix
+              // Fallback if no boards found
               if (targetBoards.length === 0) {
-                console.log('No valid boards found, defaulting to panther-x2');
-                targetBoards = [{ "id": "panther-x2", "defconfig": "panther_x2_defconfig" }];
+                console.log('No valid boards found, using default panther-x2');
+                targetBoards = [{ id: 'panther-x2', defconfig: 'panther_x2_defconfig' }];
               }
               
-              return { "board": targetBoards };
+              return { config: { board: targetBoards } };
             } catch (error) {
-              console.error('Error loading matrix:', error.message);
-              // Fallback configuration
-              return { 
-                "board": [{ "id": "panther-x2", "defconfig": "panther_x2_defconfig" }] 
-              };
+              console.error('Matrix error:', error.message);
+              // Safe fallback configuration
+              return { config: { board: [{ id: 'panther-x2', defconfig: 'panther_x2_defconfig' }] } };
             }
 
-      - name: Set up Docker Buildx
+      - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           install: true
-          version: latest
+          driver-opts: network=host
 
-      - name: Login to GHCR (public repos only)
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
-        if: ${{ github.repository_owner != 'twfjcn' }}
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build HAOS builder image
-        id: build_haos_builder
+      - name: Build HAOS Builder Image
+        id: builder
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: Dockerfile
-          tags: ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:latest
+          tags: ${{ env.BUILDER_IMAGE }}
+          # Cache configuration
           cache-from: |
-            type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:cache-${{ steps.version.outputs.version_main }}
             type=local,src=/tmp/buildx-cache
+            type=registry,ref=${{ env.BUILDER_IMAGE }}:cache-${{ steps.version.outputs.main }}
           cache-to: |
-            type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:cache-${{ steps.version.outputs.version_main }},mode=max
             type=local,dest=/tmp/buildx-cache-new,mode=max
-          push: ${{ github.repository_owner != 'twfjcn' }}
-          load: ${{ github.repository_owner == 'twfjcn' }}
-          outputs: ${{ github.repository_owner == 'twfjcn' && 'type=docker,dest=/tmp/haos-builder.tar' || '' }}
+            type=registry,ref=${{ env.BUILDER_IMAGE }}:cache-${{ steps.version.outputs.main }},mode=max
+          # Private repo: load only, no push
+          push: ${{ env.REPO_OWNER != 'twfjcn' }}
+          load: ${{ env.REPO_OWNER == 'twfjcn' }}
+          outputs: ${{ env.REPO_OWNER == 'twfjcn' && 'type=docker,dest=/tmp/haos-builder.tar' || '' }}
+          # Performance optimizations
           provenance: false
           sbom: false
+          pull: true
 
-      - name: Relocate build cache
+      - name: Relocate Build Cache
         run: |
           rm -rf /tmp/buildx-cache
           mv /tmp/buildx-cache-new /tmp/buildx-cache
 
-      - name: Export image name
-        id: export_image
+      - name: Export Builder Image Name
         run: |
-          if [ "${{ github.repository_owner }}" = "twfjcn" ]; then
-            IMAGE_NAME="ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:latest"
+          if [[ "${{ env.REPO_OWNER }}" == "twfjcn" ]]; then
+            IMAGE_REF="${{ env.BUILDER_IMAGE }}"
           else
-            IMAGE_NAME="ghcr.io/${{ env.GHCR_OWNER }}/haos-builder@${{ steps.build_haos_builder.outputs.digest }}"
+            IMAGE_REF="${{ env.BUILDER_IMAGE }}@${{ steps.builder.outputs.digest }}"
           fi
-          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "Using builder image: ${IMAGE_NAME}"
+          echo "image=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Using builder image: ${IMAGE_REF}"
 
-      - name: Generate self-signed RAUC certificate
-        id: generate_signing_key
+      - name: Generate RAUC Certificates
+        id: certs
         if: ${{ !secrets.RAUC_CERTIFICATE || !secrets.RAUC_PRIVATE_KEY }}
         run: |
-          echo "::warning:: Using self-signed RAUC certificate (no secrets provided)"
+          echo "::warning:: Generating self-signed RAUC certificates"
           
-          # Create script directory if missing
-          mkdir -p "${BUILD_ROOT}/buildroot-external/scripts"
-          SCRIPT_PATH="${BUILD_ROOT}/buildroot-external/scripts/generate-signing-key.sh"
+          # Prepare script directory
+          SCRIPT_DIR="${WORKSPACE}/buildroot-external/scripts"
+          mkdir -p "${SCRIPT_DIR}"
+          SCRIPT_PATH="${SCRIPT_DIR}/generate-signing-key.sh"
           
-          # Check if script exists
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "::error:: Signing key script not found at ${SCRIPT_PATH}"
+          # Check for existing script
+          if [[ ! -f "${SCRIPT_PATH}" ]]; then
+            echo "::error:: Signing script not found at ${SCRIPT_PATH}"
             exit 1
           fi
           
-          # Make script executable and generate certs
-          chmod +x "$SCRIPT_PATH"
-          "$SCRIPT_PATH" cert.pem key.pem
+          # Generate certificates
+          chmod +x "${SCRIPT_PATH}"
+          "${SCRIPT_PATH}" cert.pem key.pem
           
-          # Verify cert generation
-          if [ -f "cert.pem" ] && [ -f "key.pem" ]; then
-            echo "self_signed_cert=true" >> "$GITHUB_OUTPUT"
+          # Verify generation
+          if [[ -f "cert.pem" && -f "key.pem" ]]; then
+            echo "self_signed=true" >> "$GITHUB_OUTPUT"
             echo "Successfully generated self-signed certificates"
           else
-            echo "::error:: Failed to generate self-signed certificates"
+            echo "::error:: Certificate generation failed"
             exit 1
           fi
 
-      - name: Upload signing artifacts
+      - name: Upload Signing Certificates
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ steps.generate_signing_key.outcome == 'success' }}
+        if: ${{ steps.certs.outputs.self_signed == 'true' }}
         with:
-          name: rauc-signing-keys
+          name: rauc-certs
           path: |
             cert.pem
             key.pem
           retention-days: 1
           if-no-files-found: error
 
-  # 构建阶段：针对每个设备构建HAOS镜像
+  # --------------------------------------------------------------------------
+  # Build Stage: Per-board HAOS image compilation
+  # --------------------------------------------------------------------------
   build:
-    name: Build HAOS - ${{ matrix.board.id }}
+    name: Build ${{ matrix.board.id }}
     needs: prepare
     runs-on: ubuntu-22.04
-    timeout-minutes: ${{ env.BUILD_TIMEOUT_MINUTES }}
+    timeout-minutes: ${{ env.BUILD_TIMEOUT }}
     permissions:
       contents: write
       packages: read
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
-    outputs:
-      artifact_name: haos-${{ needs.prepare.outputs.version_full }}-${{ matrix.board.id }}
     steps:
-      - name: Checkout source code
+      - name: Checkout Source Code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          submodules: recursive
           persist-credentials: false
           token: ${{ github.token }}
-          submodules: recursive
           fetch-depth: 1
 
-      - name: Load local builder image (twfjcn only)
-        if: ${{ github.repository_owner == 'twfjcn' }}
+      - name: Load Local Builder Image (twfjcn)
+        if: ${{ env.REPO_OWNER == 'twfjcn' }}
         run: |
           echo "Loading local builder image..."
           docker load < /tmp/haos-builder.tar
-          docker image inspect ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:latest
-          echo "Image loaded successfully"
+          docker image inspect ${{ env.BUILDER_IMAGE }}
+          echo "✅ Builder image loaded successfully"
 
-      - name: Setup Python environment
-        if: ${{ github.event_name != 'release' }}
+      - name: Setup Python Environment
+        if: ${{ needs.prepare.outputs.publish == 'true' }}
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
           cache-dependency-path: |
             **/requirements.txt
-            **/setup.py
             .github/workflows/requirements.txt
 
-      - name: Install AWS CLI (for R2 upload)
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
+      - name: Install AWS CLI for R2
+        if: ${{ needs.prepare.outputs.publish == 'true' }}
         run: |
-          echo "Installing AWS CLI..."
           pip install --upgrade pip
           pip install 'awscli<1.37.0' boto3 botocore
-          aws --version || echo "::warning:: AWS CLI installation verification failed"
+          aws --version || echo "::warning:: AWS CLI verification failed"
 
-      - name: Maximize build disk space
+      - name: Maximize Build Disk Space
         run: |
-          echo "=== Disk space before cleanup ==="
+          echo "=== Disk Space Before Cleanup ==="
           df -h
           
-          # Basic cleanup
+          # Critical cleanup for large builds
           sudo swapoff -a
           sudo rm -f /swapfile
           sudo apt-get autoremove -y --purge
@@ -392,89 +385,90 @@ jobs:
           # Create build directories
           sudo mkdir -p ${{ env.CACHE_DIR }} ${{ env.OUTPUT_DIR }}
           sudo chown -R $USER:$USER ${{ env.CACHE_DIR }} ${{ env.OUTPUT_DIR }}
-          ln -sf ${{ env.OUTPUT_DIR }} ${{ env.BUILD_ROOT }}/output
+          ln -sf ${{ env.OUTPUT_DIR }} ${{ env.WORKSPACE }}/output
           
-          echo "=== Disk space after cleanup ==="
+          echo "=== Disk Space After Cleanup ==="
           df -h
 
-      - name: Download RAUC signing keys
+      - name: Download RAUC Certificates
         if: ${{ needs.prepare.outputs.self_signed_cert == 'true' }}
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: rauc-signing-keys
-          path: ${{ env.BUILD_ROOT }}
+          name: rauc-certs
+          path: ${{ env.WORKSPACE }}
 
-      - name: Configure RAUC certificates
+      - name: Configure RAUC Certificates
         run: |
           echo "Configuring RAUC certificates..."
-          RAUC_DIR="${BUILD_ROOT}/buildroot-external/rauc"
-          mkdir -p "$RAUC_DIR"
+          RAUC_DIR="${WORKSPACE}/buildroot-external/rauc"
+          mkdir -p "${RAUC_DIR}"
           
-          if [ "${{ needs.prepare.outputs.self_signed_cert }}" = "true" ]; then
-            cp "${BUILD_ROOT}/cert.pem" "${RAUC_DIR}/"
-            cp "${BUILD_ROOT}/key.pem" "${RAUC_DIR}/"
+          # Install certificates
+          if [[ "${{ needs.prepare.outputs.self_signed_cert }}" == "true" ]]; then
+            cp "${WORKSPACE}/cert.pem" "${RAUC_DIR}/"
+            cp "${WORKSPACE}/key.pem" "${RAUC_DIR}/"
           else
             echo "${{ secrets.RAUC_CERTIFICATE }}" > "${RAUC_DIR}/cert.pem"
             echo "${{ secrets.RAUC_PRIVATE_KEY }}" > "${RAUC_DIR}/key.pem"
           fi
           
-          # Set secure permissions
+          # Secure permissions
           chmod 600 "${RAUC_DIR}"/*.pem
-          echo "RAUC certificates configured successfully"
+          ls -la "${RAUC_DIR}"
 
-      - name: Restore build cache
+      - name: Restore Build Cache
         uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
-          path: ${{ env.CACHE_DIR }}/cc
-          key: haos-build-cache-${{ matrix.board.id }}-${{ github.sha }}
+          path: ${{ env.CACHE_DIR }}
+          key: haos-build-${{ matrix.board.id }}-${{ github.sha }}
           restore-keys: |
-            haos-build-cache-${{ matrix.board.id }}-
-            haos-build-cache-
+            haos-build-${{ matrix.board.id }}-
+            haos-build-
 
-      - name: Generate build configuration
+      - name: Generate Board Configuration
         uses: "./.github/actions/haos-builder-command"
         with:
-          image: ${{ needs.prepare.outputs.build_container_image }}
+          image: ${{ needs.prepare.outputs.builder_image }}
           command: make ${{ matrix.board.defconfig }}_defconfig
         env:
-          BR2_EXTERNAL: ${{ env.BUILD_ROOT }}/buildroot-external
+          BR2_EXTERNAL: ${{ env.WORKSPACE }}/buildroot-external
           BR2_CONFIG: ${{ env.OUTPUT_DIR }}/.config
-          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-      - name: Apply channel configuration
-        if: ${{ needs.prepare.outputs.hassio_channel_option != 'BR2_PACKAGE_HASSIO_CHANNEL_STABLE' }}
+      - name: Apply Channel Configuration
+        if: ${{ needs.prepare.outputs.hassio_channel != 'BR2_PACKAGE_HASSIO_CHANNEL_STABLE' }}
         uses: "./.github/actions/haos-builder-command"
         with:
-          image: ${{ needs.prepare.outputs.build_container_image }}
+          image: ${{ needs.prepare.outputs.builder_image }}
           command: |
-            bash -c 'echo "${{ needs.prepare.outputs.hassio_channel_option }}=y" >> ${{ env.OUTPUT_DIR }}/.config && make olddefconfig'
+            bash -c 'echo "${{ needs.prepare.outputs.hassio_channel }}=y" >> ${{ env.OUTPUT_DIR }}/.config && make olddefconfig'
 
-      - name: Build HAOS image
+      - name: Compile HAOS Image
         uses: "./.github/actions/haos-builder-command"
         with:
-          image: ${{ needs.prepare.outputs.build_container_image }}
+          image: ${{ needs.prepare.outputs.builder_image }}
           command: make -j$(nproc)
         env:
           BR2_JLEVEL: $(nproc)
           BR2_CONFIG: ${{ env.OUTPUT_DIR }}/.config
-          BR2_EXTERNAL: ${{ env.BUILD_ROOT }}/buildroot-external
+          BR2_EXTERNAL: ${{ env.WORKSPACE }}/buildroot-external
+          TMPDIR: /tmp
 
-      - name: Validate Linux configuration
+      - name: Validate Linux Configuration
         uses: "./.github/actions/haos-builder-command"
         with:
-          image: ${{ needs.prepare.outputs.build_container_image }}
+          image: ${{ needs.prepare.outputs.builder_image }}
           command: |
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
 
-      - name: Save build cache
+      - name: Save Build Cache
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         if: ${{ github.ref == 'refs/heads/dev' }}
         with:
-          path: ${{ env.CACHE_DIR }}/cc
-          key: haos-build-cache-${{ matrix.board.id }}-${{ github.sha }}
+          path: ${{ env.CACHE_DIR }}
+          key: haos-build-${{ matrix.board.id }}-${{ github.sha }}
 
-      - name: Upload artifacts to R2 storage
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
+      - name: Upload to R2 Storage
+        if: ${{ needs.prepare.outputs.publish == 'true' }}
         working-directory: ${{ env.OUTPUT_DIR }}/images
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_OS_ARTIFACTS_ID }}
@@ -482,84 +476,82 @@ jobs:
           AWS_DEFAULT_REGION: auto
         run: |
           # Validate credentials
-          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-            echo "::warning:: AWS credentials not configured - skipping R2 upload"
+          if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
+            echo "::warning:: AWS credentials not configured"
             exit 0
           fi
           
-          # Upload with retries
-          UPLOAD_SUCCESS=false
-          VERSION="${{ needs.prepare.outputs.version_full }}"
+          # Upload with retry logic
+          VERSION="${{ needs.prepare.outputs.version }}"
           BOARD="${{ matrix.board.id }}"
           BUCKET="${{ secrets.R2_OS_ARTIFACTS_BUCKET }}"
           ENDPOINT="${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}"
           
+          echo "Uploading ${BOARD} build to R2 (version: ${VERSION})..."
           for attempt in {1..3}; do
-            echo "Attempt $attempt to upload artifacts to R2..."
             if aws s3 sync \
                 ./ \
                 "s3://${BUCKET}/${VERSION}/${BOARD}/" \
                 --exclude "*" \
                 --include "haos_*" \
                 --endpoint-url "${ENDPOINT}"; then
-              UPLOAD_SUCCESS=true
-              break
+              echo "✅ Upload successful (attempt ${attempt})"
+              exit 0
             fi
-            echo "::warning:: Upload attempt $attempt failed"
+            echo "⚠️ Upload attempt ${attempt} failed, retrying in 15s..."
             sleep 15
           done
           
-          if [ "$UPLOAD_SUCCESS" = false ]; then
-            echo "::error:: All upload attempts failed"
-            exit 1
-          fi
-          echo "Successfully uploaded artifacts to R2"
+          echo "::error:: All upload attempts failed"
+          exit 1
 
-      - name: Upload release assets
+      - name: Upload Release Assets
         if: ${{ github.event_name == 'release' }}
         uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
         with:
           upload_url: ${{ github.event.release.upload_url }}
           asset_path: ${{ env.OUTPUT_DIR }}/images/haos_*
-          asset_name: haos-${{ needs.prepare.outputs.version_full }}-${{ matrix.board.id }}.img.xz
+          asset_name: haos-${{ needs.prepare.outputs.version }}-${{ matrix.board.id }}.img.xz
           asset_content_type: application/x-xz
 
-      - name: Generate build summary
+      - name: Generate Build Summary
         run: |
           echo "# Build Summary - ${{ matrix.board.id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Build Information" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Version**: ${{ needs.prepare.outputs.version_full }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Basic Information" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version**: ${{ needs.prepare.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Channel**: ${{ needs.prepare.outputs.channel }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Hass.io Channel**: ${{ needs.prepare.outputs.hassio_channel_option }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Builder Image**: ${{ needs.prepare.outputs.build_container_image }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Hass.io Channel**: ${{ needs.prepare.outputs.hassio_channel }}" >> "$GITHUB_STEP_SUMMARY"
           
           echo "## Artifacts" >> "$GITHUB_STEP_SUMMARY"
-          echo "| File | Size (Bytes) | Size (Human) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|--------------|--------------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | Size (Bytes) | Human Readable |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|--------------|----------------|" >> "$GITHUB_STEP_SUMMARY"
           
+          # List build artifacts
           for file in ${{ env.OUTPUT_DIR }}/images/haos_*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
+            if [[ -f "$file" ]]; then
+              name=$(basename "$file")
               size_bytes=$(du -b "$file" | cut -f1)
               size_human=$(du -bh "$file" | cut -f1)
-              echo "| $filename | $size_bytes | $size_human |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| $name | $size_bytes | $size_human |" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
 
-      - name: Upload build artifacts
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: haos-${{ needs.prepare.outputs.version_full }}-${{ matrix.board.id }}
+          name: haos-${{ needs.prepare.outputs.version }}-${{ matrix.board.id }}
           path: |
             ${{ env.OUTPUT_DIR }}/images/haos_*
             ${{ env.OUTPUT_DIR }}/.config
-            ${{ env.BUILD_ROOT }}/buildroot-external/meta
-          retention-days: 7
+            ${{ env.WORKSPACE }}/buildroot-external/meta
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
           if-no-files-found: warn
 
-  # 完成阶段：汇总构建结果
+  # --------------------------------------------------------------------------
+  # Completion Stage: Final status check and reporting
+  # --------------------------------------------------------------------------
   complete:
-    name: Build completion
+    name: Build Completion
     needs: [prepare, build]
     runs-on: ubuntu-22.04
     if: ${{ always() }}
@@ -567,36 +559,44 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: Check build status
+      - name: Check Build Status
         run: |
-          if [ "${{ needs.build.result }}" = "failure" ]; then
-            echo "::error:: One or more builds failed"
+          if [[ "${{ needs.build.result }}" == "failure" ]]; then
+            echo "::error:: ❌ One or more board builds failed"
             exit 1
-          elif [ "${{ needs.build.result }}" = "cancelled" ]; then
-            echo "::warning:: Build was cancelled"
+          elif [[ "${{ needs.build.result }}" == "cancelled" ]]; then
+            echo "::warning:: ⚠️ Build workflow was cancelled"
             exit 0
           else
-            echo "✅ All builds completed successfully"
+            echo "::notice:: ✅ All builds completed successfully"
             exit 0
           fi
 
-      - name: Generate build report
+      - name: Generate Build Report
         run: |
-          echo "# HAOS Build Report - ${{ needs.prepare.outputs.version_full }}" > build-report.md
-          echo "## Build Information" >> build-report.md
-          echo "- **Build Time**: $(date --utc)" >> build-report.md
-          echo "- **Trigger**: ${{ github.event_name }}" >> build-report.md
-          echo "- **Commit**: ${{ github.sha }}" >> build-report.md
-          echo "- **Channel**: ${{ needs.prepare.outputs.channel }}" >> build-report.md
-          echo "" >> build-report.md
-          echo "## Built Devices" >> build-report.md
-          echo "- ${{ join(needs.build.outputs.artifact_name, '\n- ') }}" >> build-report.md
+          # Create comprehensive build report
+          cat > build-report.md << EOF
+          # HAOS Build Report
+          **Build Time**: $(date -u)
+          **Version**: ${{ needs.prepare.outputs.version }}
+          **Trigger**: ${{ github.event_name }}
+          **Commit**: ${{ github.sha }}
+          **Channel**: ${{ needs.prepare.outputs.channel }}
           
+          ## Built Boards
+          - $(echo '${{ toJSON(matrix.board) }}' | jq -r '.[].id' | tr '\n' ' ' | sed 's/ $//')
+          
+          ## Artifacts
+          - Artifact retention: ${{ env.ARTIFACT_RETENTION }} days
+          - Builder image: ${{ needs.prepare.outputs.builder_image }}
+          EOF
+          
+          # Display report
           cat build-report.md
 
-      - name: Upload build report
+      - name: Upload Build Report
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: build-report
+          name: build-report-${{ needs.prepare.outputs.version }}
           path: build-report.md
-          retention-days: 7
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
