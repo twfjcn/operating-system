@@ -55,6 +55,7 @@ jobs:
       build_container_image: ${{ env.BUILDER_IMAGE }}
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
+      release_tag: ${{ steps.set_release_tag.outputs.release_tag }}
     steps:
       - name: Checkout source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -117,6 +118,15 @@ jobs:
           if [ "${{ steps.version.outputs.version_full }}" != "${{ github.event.release.tag_name }}" ]; then
             echo "Version number in Buildroot metadata does not match tag (${{ steps.version.outputs.version_full }} vs ${{ github.event.release.tag_name }})."
             exit 1
+          fi
+
+      - name: Set Release Tag
+        id: set_release_tag
+        run: |
+          if [ "${{ github.event_name }}" == "release" ]; then
+            echo "release_tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "release_tag=${{ steps.version.outputs.version_full }}" >> $GITHUB_OUTPUT
           fi
 
       - name: Get channel
@@ -202,7 +212,7 @@ jobs:
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
-      contents: write
+      contents: write  # 授予写入Releases的权限
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
@@ -314,12 +324,30 @@ jobs:
             --include "haos_*" \
             --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
 
-      - name: Upload release assets
-        if: ${{ github.event_name == 'release' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+      # 新增：创建Release（如果不存在）
+      - name: Create Release (if not exists)
+        id: create_release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v2.0.8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ github.event.release.upload_url }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: HAOS ${{ needs.prepare.outputs.release_tag }} (${{ matrix.board.id }})
+          body: "Automatically built HAOS image for ${{ matrix.board.id }} - Version ${{ needs.prepare.outputs.release_tag }}"
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.channel == 'beta' || needs.prepare.outputs.channel == 'dev' }}
+          fail_on_unmatched_files: false
+
+      # 修改：移除release事件限制，所有构建都上传到Releases
+      - name: Upload all artifacts to Release
+        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: output/images/haos_*
+          asset_name: ${{ matrix.board.id }}-haos_${{ needs.prepare.outputs.version_full }}_{name}
+          asset_content_type: application/octet-stream
 
       - name: Print cache stats
         run: |
@@ -364,10 +392,9 @@ jobs:
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
 
-      # 所有产物上传步骤保持不变
+      # 保留原有的Artifact上传（可选，作为备份）
       - name: Upload OS image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
           path: |
@@ -375,7 +402,6 @@ jobs:
 
       - name: Upload RAUC bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
           path: |
@@ -383,7 +409,7 @@ jobs:
 
       - name: Upload Open Virtualization Format (OVA) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
+        if: ${{ matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
           path: |
@@ -391,7 +417,7 @@ jobs:
 
       - name: Upload QEMU disk image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
+        if: ${{ matrix.board.id == 'ova' || matrix.board.id == 'generic-aarch64' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
           path: |
@@ -399,7 +425,7 @@ jobs:
 
       - name: Upload VMware Virtual Machine Disk (VMDK) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
+        if: ${{ matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
           path: |
@@ -407,7 +433,7 @@ jobs:
 
       - name: Upload VirtualBox Virtual Disk Image (VDI) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
+        if: ${{ matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
           path: |
@@ -415,7 +441,7 @@ jobs:
 
       - name: Upload Virtual Hard Disk v2 (VHDX) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
+        if: ${{ matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
           path: |
