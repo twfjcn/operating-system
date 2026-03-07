@@ -34,7 +34,7 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
-  # 官方稳定版别名：自动拉取最新正式版，非 dev
+  # 官方稳定版镜像（自动拉取最新正式版，非 dev）
   BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:stable"
 
 jobs:
@@ -350,13 +350,17 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.channel == 'beta' || needs.prepare.outputs.channel == 'dev' }}
           fail_on_unmatched_files: false
 
-      # 修复：循环逐个上传所有产物文件到 Release（解决多文件上传冲突）
+      # 安装 GitHub CLI 用于上传文件
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update && sudo apt-get install -y gh
+
+      # 循环逐个上传所有产物文件到 Release（解决多文件上传冲突）
       - name: Upload all artifacts to Release (one by one)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPLOAD_URL: ${{ steps.create_release.outputs.upload_url }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
           BOARD_ID: ${{ matrix.board.id }}
-          VERSION_FULL: ${{ needs.prepare.outputs.version_full }}
         run: |
           # 进入产物目录
           cd output/images
@@ -365,18 +369,12 @@ jobs:
             if [ -f "$file" ]; then
               # 生成带设备前缀的文件名（避免重名）
               new_filename="${BOARD_ID}-${file}"
-              # 重命名文件（可选，也可直接上传）
               mv "$file" "$new_filename"
               echo "🔼 正在上传文件: $new_filename"
-              # 逐个上传文件到 Release（支持覆盖）
-              gh release upload "${{ needs.prepare.outputs.release_tag }}" "$new_filename" \
-                --repo "${{ github.repository }}" \
-                --clobber
+              # 逐个上传文件到 Release（支持覆盖已有文件）
+              gh release upload "${RELEASE_TAG}" "$new_filename" --repo "${{ github.repository }}" --clobber
             fi
           done
-        # 确保 gh 命令可用
-        before_install:
-          - sudo apt-get update && sudo apt-get install -y gh
 
       - name: Print cache stats
         run: |
