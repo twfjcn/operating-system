@@ -34,8 +34,10 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
-  # 官方稳定版镜像（自动拉取最新正式版，非 dev）
-  BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:stable"
+  # 使用官方已发布的具体稳定版本号（当前最新 17.2，可根据官方更新调整）
+  BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:17.2"
+  # 备选版本（如果主版本拉取失败，自动尝试）
+  FALLBACK_BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:17"
 
 jobs:
   prepare:
@@ -52,7 +54,7 @@ jobs:
       channel: ${{ steps.channel.outputs.channel }}
       hassio_channel_option: ${{ steps.channel.outputs.hassio_channel_option }}
       matrix: ${{ steps.generate_matrix.outputs.result }}
-      build_container_image: ${{ env.BUILDER_IMAGE }}
+      build_container_image: ${{ steps.pull_builder_image.outputs.used_image }}
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
       release_tag: ${{ steps.set_release_tag.outputs.release_tag }}
@@ -182,20 +184,41 @@ jobs:
               return { "board": buildBoards }
             }
 
-      # 拉取官方稳定版镜像 + 校验非 dev
+      # 修复：拉取官方具体稳定版本镜像（带重试和备选版本）
       - name: Pull official stable haos-builder image
+        id: pull_builder_image
         run: |
-          docker pull ${{ env.BUILDER_IMAGE }}
-          # 校验：确保不是 dev 开发版
-          if docker inspect ${{ env.BUILDER_IMAGE }} | grep -q "dev"; then
+          # 先尝试拉取主版本
+          echo "🔍 尝试拉取主版本: ${{ env.BUILDER_IMAGE }}"
+          if docker pull "${{ env.BUILDER_IMAGE }}"; then
+            USED_IMAGE="${{ env.BUILDER_IMAGE }}"
+            echo "✅ 成功拉取主版本镜像"
+          else
+            # 主版本失败，尝试备选版本
+            echo "⚠️ 主版本拉取失败，尝试备选版本: ${{ env.FALLBACK_BUILDER_IMAGE }}"
+            if docker pull "${{ env.FALLBACK_BUILDER_IMAGE }}"; then
+              USED_IMAGE="${{ env.FALLBACK_BUILDER_IMAGE }}"
+              echo "✅ 成功拉取备选版本镜像"
+            else
+              echo "::error:: 所有备选镜像都拉取失败！"
+              exit 1
+            fi
+          fi
+
+          # 校验：确保镜像标签不含 dev（避免开发版）
+          if echo "$USED_IMAGE" | grep -q "dev"; then
             echo "::error:: 拉取的镜像包含 dev 标签，不是正式版！"
             exit 1
           fi
-          # 打印确认信息
+
+          # 打印镜像信息确认
           echo "✅ 已拉取正式版 haos-builder 镜像："
           docker images | grep haos-builder
-          docker inspect ${{ env.BUILDER_IMAGE }} --format '  标签: {{.RepoTags}}'
-          docker inspect ${{ env.BUILDER_IMAGE }} --format '  构建时间: {{.Created}}'
+          docker inspect "$USED_IMAGE" --format '  标签: {{.RepoTags}}'
+          docker inspect "$USED_IMAGE" --format '  构建时间: {{.Created}}'
+
+          # 输出使用的镜像标签（供后续步骤使用）
+          echo "used_image=$USED_IMAGE" >> "$GITHUB_OUTPUT"
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -224,8 +247,9 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     runs-on: ubuntu-22.04
+    matrix:
+      board: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout source
@@ -234,11 +258,12 @@ jobs:
           submodules: true
           persist-credentials: false
 
-      # build 阶段再次拉取 + 校验
-      - name: Pull official stable haos-builder image
+      # build 阶段再次拉取相同版本镜像
+      - name: Pull official stable haos-builder image (build stage)
         run: |
-          docker pull ${{ env.BUILDER_IMAGE }}
-          if docker inspect ${{ env.BUILDER_IMAGE }} | grep -q "dev"; then
+          docker pull "${{ needs.prepare.outputs.build_container_image }}"
+          # 再次校验
+          if echo "${{ needs.prepare.outputs.build_container_image }}" | grep -q "dev"; then
             echo "::error:: 拉取的镜像包含 dev 标签，不是正式版！"
             exit 1
           fi
@@ -299,7 +324,7 @@ jobs:
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
-          command: make ${{ matrix.board.defconfig }}_defconfig
+          command: make ${{ matrix.board.id }}_defconfig
 
       - name: Override release channel
         if: ${{ needs.prepare.outputs.hassio_channel_option != 'BR2_PACKAGE_HASSIO_CHANNEL_STABLE' }}
@@ -355,7 +380,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y gh
 
-      # 循环逐个上传所有产物文件到 Release（解决多文件上传冲突）
+      # 循环逐个上传所有产物文件到 Release
       - name: Upload all artifacts to Release (one by one)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -371,7 +396,7 @@ jobs:
               new_filename="${BOARD_ID}-${file}"
               mv "$file" "$new_filename"
               echo "🔼 正在上传文件: $new_filename"
-              # 逐个上传文件到 Release（支持覆盖已有文件）
+              # 逐个上传文件到 Release（支持覆盖）
               gh release upload "${RELEASE_TAG}" "$new_filename" --repo "${{ github.repository }}" --clobber
             fi
           done
