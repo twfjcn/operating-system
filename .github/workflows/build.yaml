@@ -34,6 +34,8 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
+  # 使用官方预构建的haos-builder镜像
+  BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:latest"
 
 jobs:
   prepare:
@@ -50,7 +52,7 @@ jobs:
       channel: ${{ steps.channel.outputs.channel }}
       hassio_channel_option: ${{ steps.channel.outputs.hassio_channel_option }}
       matrix: ${{ steps.generate_matrix.outputs.result }}
-      build_container_image: haos-builder:local
+      build_container_image: ${{ env.BUILDER_IMAGE }}
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
     steps:
@@ -171,39 +173,11 @@ jobs:
               return { "board": buildBoards }
             }
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      # 简化构建逻辑：直接用docker build，不用build-push-action（避免复杂配置）
-      - name: Build local haos-builder image (简化版)
+      # 直接拉取官方镜像，无需本地构建
+      - name: Pull official haos-builder image
         run: |
-          # 打印Docker信息，调试用
-          docker --version
-          docker buildx version
-          # 构建镜像，禁用缓存，确保构建成功
-          docker build -t haos-builder:local -f Dockerfile . --no-cache
-          # 验证镜像是否存在
+          docker pull ${{ env.BUILDER_IMAGE }}
           docker images | grep haos-builder
-
-      # 容错：先检查镜像是否存在，再保存
-      - name: Save haos-builder image to tar (带容错)
-        run: |
-          # 检查镜像是否存在
-          if docker images | grep -q "haos-builder:local"; then
-            docker save haos-builder:local -o haos-builder.tar
-            ls -lh haos-builder.tar
-            echo "镜像保存成功"
-          else
-            echo "::error:: haos-builder:local 镜像不存在，构建失败！"
-            exit 1
-          fi
-
-      - name: Upload haos-builder image artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: haos-builder-image
-          path: haos-builder.tar
-          retention-days: 1
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -242,15 +216,10 @@ jobs:
           submodules: true
           persist-credentials: false
 
-      - name: Download haos-builder image artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: haos-builder-image
-          path: .
-
-      - name: Load haos-builder image into Docker
+      # 拉取官方镜像（确保build阶段也有）
+      - name: Pull official haos-builder image
         run: |
-          docker load -i haos-builder.tar
+          docker pull ${{ env.BUILDER_IMAGE }}
           docker images | grep haos-builder
 
       - name: Setup Python version ${{ env.PYTHON_VERSION }}
@@ -395,6 +364,7 @@ jobs:
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
 
+      # 所有产物上传步骤保持不变
       - name: Upload OS image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
