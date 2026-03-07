@@ -34,8 +34,8 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
-  # 使用官方预构建的haos-builder镜像
-  BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:latest"
+  # 官方稳定版别名：自动拉取最新正式版，非 dev
+  BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:stable"
 
 jobs:
   prepare:
@@ -143,17 +143,17 @@ jobs:
           fi
           if [[ "${{ inputs.hassio_channel }}" == "default" ]]; then
             if [[ "${{ github.event_name }}" == "release" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> $GITHUB_OUTPUT
             else
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> $GITHUB_OUTPUT
             fi
           else
             if [[ "${{ inputs.hassio_channel }}" == "stable" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> $GITHUB_OUTPUT
             elif [[ "${{ inputs.hassio_channel }}" == "beta" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT"
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> $GITHUB_OUTPUT
             elif [[ "${{ inputs.hassio_channel }}" == "dev" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> $GITHUB_OUTPUT
             fi
           fi
 
@@ -174,7 +174,6 @@ jobs:
             } else {
               console.log("Run partial build")
               const boardSet = new Set(boardFilter.split(","))
-              // if tests are enabled, we need to ensure the OVA board is included
               if (runTests && !boardSet.has("ova")) {
                 console.log("Adding OVA board for integration tests")
                 boardSet.add("ova")
@@ -183,11 +182,20 @@ jobs:
               return { "board": buildBoards }
             }
 
-      # 直接拉取官方镜像，无需本地构建
-      - name: Pull official haos-builder image
+      # 拉取官方稳定版镜像 + 校验非 dev
+      - name: Pull official stable haos-builder image
         run: |
           docker pull ${{ env.BUILDER_IMAGE }}
+          # 校验：确保不是 dev 开发版
+          if docker inspect ${{ env.BUILDER_IMAGE }} | grep -q "dev"; then
+            echo "::error:: 拉取的镜像包含 dev 标签，不是正式版！"
+            exit 1
+          fi
+          # 打印确认信息
+          echo "✅ 已拉取正式版 haos-builder 镜像："
           docker images | grep haos-builder
+          docker inspect ${{ env.BUILDER_IMAGE }} --format '  标签: {{.RepoTags}}'
+          docker inspect ${{ env.BUILDER_IMAGE }} --format '  构建时间: {{.Created}}'
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -212,7 +220,7 @@ jobs:
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
-      contents: write  # 授予写入Releases的权限
+      contents: write
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
@@ -226,10 +234,14 @@ jobs:
           submodules: true
           persist-credentials: false
 
-      # 拉取官方镜像（确保build阶段也有）
-      - name: Pull official haos-builder image
+      # build 阶段再次拉取 + 校验
+      - name: Pull official stable haos-builder image
         run: |
           docker pull ${{ env.BUILDER_IMAGE }}
+          if docker inspect ${{ env.BUILDER_IMAGE }} | grep -q "dev"; then
+            echo "::error:: 拉取的镜像包含 dev 标签，不是正式版！"
+            exit 1
+          fi
           docker images | grep haos-builder
 
       - name: Setup Python version ${{ env.PYTHON_VERSION }}
@@ -324,7 +336,7 @@ jobs:
             --include "haos_*" \
             --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
 
-      # 新增：创建Release（如果不存在）
+      # 自动创建 Release（不存在则创建）
       - name: Create Release (if not exists)
         id: create_release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v2.0.8
@@ -338,16 +350,33 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.channel == 'beta' || needs.prepare.outputs.channel == 'dev' }}
           fail_on_unmatched_files: false
 
-      # 修改：移除release事件限制，所有构建都上传到Releases
-      - name: Upload all artifacts to Release
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+      # 修复：循环逐个上传所有产物文件到 Release（解决多文件上传冲突）
+      - name: Upload all artifacts to Release (one by one)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: output/images/haos_*
-          asset_name: ${{ matrix.board.id }}-haos_${{ needs.prepare.outputs.version_full }}_{name}
-          asset_content_type: application/octet-stream
+          UPLOAD_URL: ${{ steps.create_release.outputs.upload_url }}
+          BOARD_ID: ${{ matrix.board.id }}
+          VERSION_FULL: ${{ needs.prepare.outputs.version_full }}
+        run: |
+          # 进入产物目录
+          cd output/images
+          # 遍历所有 haos_ 开头的产物文件
+          for file in haos_*; do
+            if [ -f "$file" ]; then
+              # 生成带设备前缀的文件名（避免重名）
+              new_filename="${BOARD_ID}-${file}"
+              # 重命名文件（可选，也可直接上传）
+              mv "$file" "$new_filename"
+              echo "🔼 正在上传文件: $new_filename"
+              # 逐个上传文件到 Release（支持覆盖）
+              gh release upload "${{ needs.prepare.outputs.release_tag }}" "$new_filename" \
+                --repo "${{ github.repository }}" \
+                --clobber
+            fi
+          done
+        # 确保 gh 命令可用
+        before_install:
+          - sudo apt-get update && sudo apt-get install -y gh
 
       - name: Print cache stats
         run: |
@@ -392,7 +421,7 @@ jobs:
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
 
-      # 保留原有的Artifact上传（可选，作为备份）
+      # 保留 Artifact 上传作为备份
       - name: Upload OS image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
