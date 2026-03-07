@@ -34,7 +34,8 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
-  BUILD_TIMEOUT_MINUTES: 180  # 新增：构建超时保护
+  BUILD_TIMEOUT_MINUTES: 180  # 构建超时保护
+  GHCR_OWNER: ${{ github.repository_owner }}  # 统一GHCR所有者变量
 
 jobs:
   prepare:
@@ -44,7 +45,7 @@ jobs:
       contents: read
       pull-requests: read
       packages: write
-      id-token: write  # 新增：增强GHCR认证权限
+      id-token: write  # GHCR OIDC认证所需
     outputs:
       version_dev: ${{ steps.version_dev.outputs.version_dev }}
       version_main: ${{ steps.version.outputs.version_main }}
@@ -52,7 +53,7 @@ jobs:
       channel: ${{ steps.channel.outputs.channel }}
       hassio_channel_option: ${{ steps.channel.outputs.hassio_channel_option }}
       matrix: ${{ steps.generate_matrix.outputs.result }}
-      build_container_image: ghcr.io/${{ github.repository_owner }}/haos-builder@${{ steps.build_haos_builder.outputs.digest }}
+      build_container_image: ${{ steps.build_haos_builder.outputs.image_name }}
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
     steps:
@@ -60,7 +61,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          token: ${{ github.token }}  # 新增：显式指定token
+          token: ${{ github.token }}
+          submodules: recursive  # 确保子模块完整检出
 
       - name: Check if build should be published
         id: check_publish
@@ -96,27 +98,33 @@ jobs:
         env:
           VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
         run: |
-          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta || \
+          echo "::warning:: Failed to update version suffix (file may not exist)"
 
       - name: Get version
         id: version
         run: |
-          . ${GITHUB_WORKSPACE}/buildroot-external/meta
-          echo "version_main=${VERSION_MAJOR}.${VERSION_MINOR}" >> $GITHUB_OUTPUT
-          if [ -z "${VERSION_SUFFIX}" ]; then
-            version_full="${VERSION_MAJOR}.${VERSION_MINOR}"
+          if [ -f "${{ github.workspace }}/buildroot-external/meta" ]; then
+            . "${{ github.workspace }}/buildroot-external/meta"
+            echo "version_main=${VERSION_MAJOR}.${VERSION_MINOR}" >> $GITHUB_OUTPUT
+            if [ -z "${VERSION_SUFFIX}" ]; then
+              version_full="${VERSION_MAJOR}.${VERSION_MINOR}"
+            else
+              version_full="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_SUFFIX}"
+            fi
+            echo "version_full=${version_full}" >> $GITHUB_OUTPUT
+            echo "Full version number of this release is \"${version_full}\"."
           else
-            version_full="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_SUFFIX}"
+            echo "::error:: meta file not found in buildroot-external/"
+            exit 1
           fi
-          echo "version_full=${version_full}" >> $GITHUB_OUTPUT
-          echo "Full version number of this release is \"${version_full}\"."
 
       - name: Validate version
         id: version_check
         if: ${{ github.event_name == 'release' }}
         run: |
           if [ "${{ steps.version.outputs.version_full }}" != "${{ github.event.release.tag_name }}" ]; then
-            echo "Version number in Buildroot metadata does not match tag (${{ steps.version.outputs.version_full }} vs ${{ github.event.release.tag_name }})."
+            echo "::error:: Version mismatch: Buildroot (${{ steps.version.outputs.version_full }}) vs Release (${{ github.event.release.tag_name }})"
             exit 1
           fi
 
@@ -140,13 +148,12 @@ jobs:
               echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
             fi
           else
-            if [[ "${{ inputs.hassio_channel }}" == "stable" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
-            elif [[ "${{ inputs.hassio_channel }}" == "beta" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT"
-            elif [[ "${{ inputs.hassio_channel }}" == "dev" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
-            fi
+            case ${{ inputs.hassio_channel }} in
+              stable) echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT" ;;
+              beta) echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT" ;;
+              dev) echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT" ;;
+              *) echo "::warning:: Invalid channel, using dev" && echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT" ;;
+            esac
           fi
 
       - name: Create build matrix
@@ -154,52 +161,72 @@ jobs:
         id: generate_matrix
         with:
           script: |
-            const boards = require('./.github/workflows/matrix.json')
-            if ("${{ github.event_name }}" == "release") {
-              return { "board": boards }
-            }
-
-            const boardFilter = "${{ github.event.inputs.boards }}"
-            const runTests = "${{ github.event.inputs.run_tests }}" === "true"
-
-            if (boardFilter == "") {
-              console.log("Run full build for all boards")
-              return { "board": boards }
-            } else {
-              console.log("Run partial build")
-              const boardSet = new Set(boardFilter.split(","))
-
-              // if tests are enabled, we need to ensure the OVA board is included
-              if (runTests && !boardSet.has("ova")) {
-                console.log("Adding OVA board for integration tests")
-                boardSet.add("ova")
+            try {
+              const boards = require('./.github/workflows/matrix.json');
+              if ("${{ github.event_name }}" == "release") {
+                return { "board": boards };
               }
 
-              const buildBoards = boards.filter(b => boardSet.has(b.id))
-              return { "board": buildBoards }
+              const boardFilter = "${{ github.event.inputs.boards }}";
+              const runTests = "${{ github.event.inputs.run_tests }}" === "true";
+
+              if (!boardFilter) {
+                console.log("Run full build for all boards");
+                return { "board": boards };
+              } else {
+                console.log("Run partial build");
+                const boardSet = new Set(boardFilter.split(","));
+
+                // Ensure OVA board is included if tests are enabled
+                if (runTests && !boardSet.has("ova")) {
+                  console.log("Adding OVA board for integration tests");
+                  boardSet.add("ova");
+                }
+
+                const buildBoards = boards.filter(b => boardSet.has(b.id));
+                return { "board": buildBoards };
+              }
+            } catch (error) {
+              console.error("Error loading matrix.json:", error);
+              // Fallback to default board if matrix file is missing
+              return { "board": [{ "id": "panther-x2", "defconfig": "panther_x2_defconfig" }] };
             }
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       
-      - name: Log in to the GitHub container registry
+      - name: Log in to GHCR (conditional)
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        if: ${{ github.repository_owner != 'twfjcn' }}  # 仅非私有仓库登录
         with:
             registry: ghcr.io
-            username: ${{ github.actor }}  # 修改：替换为actor提升兼容性
+            username: ${{ github.actor }}
             password: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Build and Push (兼容模式)
+      - name: Build HAOS Builder Image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         id: build_haos_builder
         with:
           context: .
           file: Dockerfile
-          tags: ghcr.io/${{ github.repository_owner }}/haos-builder
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main }},mode=max
-          push: ${{ github.repository_owner != 'twfjcn' }}  # 新增：私有仓库跳过推送
-          load: ${{ github.repository_owner == 'twfjcn' }}   # 新增：本地加载镜像
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:latest
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:cache-${{ steps.version.outputs.version_main }}
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:cache-${{ steps.version.outputs.version_main }},mode=max
+          push: ${{ github.repository_owner != 'twfjcn' }}  # 私有仓库不推送
+          load: ${{ github.repository_owner == 'twfjcn' }}   # 私有仓库本地加载
+          outputs: type=docker,dest=/tmp/haos-builder.tar  # 保存镜像到本地
+          cache-to: type=local,dest=/tmp/buildx-cache      # 本地缓存
+        env:
+          DOCKER_BUILDKIT: 1
+
+      - name: Export image name
+        id: export_image
+        run: |
+          if [ "${{ github.repository_owner }}" == "twfjcn" ]; then
+            echo "image_name=ghcr.io/${{ env.GHCR_OWNER }}/haos-builder:latest" >> $GITHUB_OUTPUT
+          else
+            echo "image_name=ghcr.io/${{ env.GHCR_OWNER }}/haos-builder@${{ steps.build_haos_builder.outputs.digest }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -208,17 +235,18 @@ jobs:
           RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
         if: env.RAUC_CERTIFICATE == '' || env.RAUC_PRIVATE_KEY == ''
         run: |
-          echo "::warning:: RAUC certificate or key is missing in the repository secrets. Building with a public self-signed certificate!"
-          # 新增：容错处理
+          echo "::warning:: RAUC certificate/key missing - using self-signed cert"
+          mkdir -p buildroot-external/scripts || true
           if [ -f "buildroot-external/scripts/generate-signing-key.sh" ]; then
+            chmod +x buildroot-external/scripts/generate-signing-key.sh
             buildroot-external/scripts/generate-signing-key.sh cert.pem key.pem
             echo "self_signed_cert=true" >> $GITHUB_OUTPUT
           else
-            echo "::error:: Signing key script not found!"
+            echo "::error:: generate-signing-key.sh not found!"
             exit 1
           fi
 
-      - name: Create signing key
+      - name: Upload signing key artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: steps.generate_signing_key.outcome == 'success'
         with:
@@ -226,96 +254,116 @@ jobs:
           path: |
             cert.pem
             key.pem
+          retention-days: 1  # 短期保留
 
   build:
-    name: Build for ${{ matrix.board.id }}
+    name: Build ${{ matrix.board.id }}
     permissions:
       contents: write
-      packages: read  # 新增：读取镜像权限
+      packages: read
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     runs-on: ubuntu-22.04
-    timeout-minutes: ${{ env.BUILD_TIMEOUT_MINUTES }}  # 新增：构建超时控制
+    timeout-minutes: ${{ env.BUILD_TIMEOUT_MINUTES }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          submodules: true
+          submodules: recursive
           persist-credentials: false
-          token: ${{ github.token }}  # 新增：显式指定token
+          token: ${{ github.token }}
 
-      - name: Setup Python version ${{ env.PYTHON_VERSION }}
+      - name: Load HAOS Builder Image (private repo)
+        if: ${{ github.repository_owner == 'twfjcn' }}
+        run: |
+          docker load < /tmp/haos-builder.tar
+          docker image ls ghcr.io/${{ env.GHCR_OWNER }}/haos-builder
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
         if: ${{ github.event_name != 'release' }}
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'  # 新增：Python依赖缓存
+          cache: 'pip'
+          cache-dependency-path: |
+            **/requirements.txt
+            **/setup.py
 
       - name: Install AWS CLI
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
         run: |
-          # 新增：容错处理
-          pip install 'awscli<1.37.0' || pip3 install 'awscli<1.37.0'
+          pip install --upgrade pip
+          pip install 'awscli<1.37.0' boto3 || pip3 install 'awscli<1.37.0' boto3
+          aws --version || echo "::warning:: AWS CLI installation failed"
 
       - name: Set version suffix
         if: ${{ github.event_name != 'release' }}
         env:
           VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
         run: |
-          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta || \
+          echo "::warning:: Failed to update version suffix"
 
-      - name: 'Add release PKI certs'
-        if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
-        env:
-          RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
-          RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
-        run: |
-          # 新增：容错处理
-          echo "${RAUC_CERTIFICATE}" > cert.pem || echo "::warning:: Failed to write cert.pem"
-          echo "${RAUC_PRIVATE_KEY}" > key.pem || echo "::warning:: Failed to write key.pem"
-
-      - name: Get self-signed certificate from the prepare job
+      - name: Download signing key artifact
         if: ${{ needs.prepare.outputs.self_signed_cert == 'true' }}
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: signing-key
+          path: .
 
-      - name: Free space on build drive (增强版)
+      - name: Configure RAUC certificates
         run: |
-          # 新增：更彻底的空间清理
+          if [ "${{ needs.prepare.outputs.self_signed_cert }}" == "true" ]; then
+            cp cert.pem buildroot-external/rauc/cert.pem || true
+            cp key.pem buildroot-external/rauc/key.pem || true
+          else
+            echo "${{ secrets.RAUC_CERTIFICATE }}" > buildroot-external/rauc/cert.pem || true
+            echo "${{ secrets.RAUC_PRIVATE_KEY }}" > buildroot-external/rauc/key.pem || true
+          fi
+          chmod 600 buildroot-external/rauc/*.pem
+
+      - name: Maximize build space
+        run: |
+          # Comprehensive space cleanup
           df -h
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/graalvm /usr/local/lib/node_modules
+          sudo swapoff -a
+          sudo rm -f /swapfile
+          sudo apt-get autoremove -y
+          sudo apt-get clean -y
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/graalvm
           sudo rm -rf /opt/ghc /usr/share/swift /usr/local/.ghcup
-          sudo apt-get clean && sudo apt-get autoremove -y
-          # 原有逻辑
-          sudo rm -rf /usr/local/lib/android/sdk/ndk
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          # Create build directories
           sudo mkdir -p /mnt/cache /mnt/output
-          WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
-          sudo ln -sf /mnt/output "${GITHUB_WORKSPACE}/output"
-          sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
-          sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
+          sudo chown -R $USER:$USER /mnt/cache /mnt/output
+          ln -sf /mnt/output ${{ github.workspace }}/output
           df -h
 
-      - name: "Restore cache: object files"
+      - name: Restore build cache
         uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}
-          restore-keys: |  # 新增：缓存回退策略
+          key: haos-cc-${{ matrix.board.id }}-${{ github.sha }}
+          restore-keys: |
             haos-cc-${{ matrix.board.id }}-
             haos-cc-
 
-      - name: Generate build config
+      - name: Generate build configuration
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: make ${{ matrix.board.defconfig }}_defconfig
+        env:
+          BR2_EXTERNAL: ${{ github.workspace }}/buildroot-external
+          BR2_CONFIG: ${{ github.workspace }}/output/.config
 
-      - name: Override release channel
+      - name: Apply channel override
         if: ${{ needs.prepare.outputs.hassio_channel_option != 'BR2_PACKAGE_HASSIO_CHANNEL_STABLE' }}
         uses: "./.github/actions/haos-builder-command"
         with:
@@ -323,43 +371,45 @@ jobs:
           command: |
             bash -c 'echo "${{ needs.prepare.outputs.hassio_channel_option }}=y" >> /build/output/.config && make olddefconfig'
 
-      - name: Build
+      - name: Build HAOS image
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
-          command: make
+          command: make -j$(nproc)
+        env:
+          PARALLEL_JOBS: $(nproc)
 
-      - name: Check Linux config
+      - name: Validate Linux config
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: |
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
 
-      - name: Upload artifacts to R2
+      - name: Upload artifacts to R2 storage
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
         working-directory: output/images/
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_OS_ARTIFACTS_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_OS_ARTIFACTS_KEY }}
+          AWS_DEFAULT_REGION: auto
         run: |
-          # 新增：重试机制 + 容错
-          if [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ]; then
-            aws s3 sync \
-              ./ \
-              s3://${{ secrets.R2_OS_ARTIFACTS_BUCKET }}/${{ needs.prepare.outputs.version_full }}/ \
-              --exclude "*" \
-              --include "haos_*" \
-              --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }} || \
-            aws s3 sync \
-              ./ \
-              s3://${{ secrets.R2_OS_ARTIFACTS_BUCKET }}/${{ needs.prepare.outputs.version_full }}/ \
-              --exclude "*" \
-              --include "haos_*" \
-              --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
-          else
-            echo "::warning:: AWS credentials not set, skipping R2 upload"
+          if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+            echo "::warning:: AWS credentials not configured - skipping upload"
+            exit 0
           fi
+          
+          # Retry upload up to 3 times
+          for i in {1..3}; do
+            aws s3 sync \
+              ./ \
+              s3://${{ secrets.R2_OS_ARTIFACTS_BUCKET }}/${{ needs.prepare.outputs.version_full }}/${{ matrix.board.id }}/ \
+              --exclude "*" \
+              --include "haos_*" \
+              --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }} && break
+            echo "::warning:: Upload attempt $i failed - retrying..."
+            sleep 10
+          done
 
       - name: Upload release assets
         if: ${{ github.event_name == 'release' }}
@@ -367,115 +417,42 @@ jobs:
         with:
           upload_url: ${{ github.event.release.upload_url }}
           asset_path: output/images/haos_*
+          asset_name: haos-${{ needs.prepare.outputs.version_full }}-${{ matrix.board.id }}.img.xz
+          asset_content_type: application/x-xz
 
-      - name: Print cache stats
-        run: |
-          # 新增：容错处理
-          echo "Cache size: $(du -sh /mnt/cache/cc || echo "N/A")"
-          echo "Files total: $(find /mnt/cache/cc -mindepth 1 -type f | wc -l || echo "0")"
-          echo "Old files to remove: $(find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile | wc -l || echo "0")"
-          find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile -delete || true
-          echo "Cache size after pruning: $(du -sh /mnt/cache/cc || echo "N/A")"
-
-      - name: "Save cache: object files"
-        if: github.ref == 'refs/heads/dev'
+      - name: Save build cache
+        if: ${{ github.ref == 'refs/heads/dev' }}
         uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}-${{ github.run_id }}
+          key: haos-cc-${{ matrix.board.id }}-${{ github.sha }}
 
       - name: Generate build summary
         run: |
-          echo "# ${{ matrix.board.id }} build summary" >> $GITHUB_STEP_SUMMARY
-          echo "## Built-in OS components" >> $GITHUB_STEP_SUMMARY
-          echo "Release channel: ${{ inputs.hassio_channel }} (${{ needs.prepare.outputs.hassio_channel_option }})" >> $GITHUB_STEP_SUMMARY
-          echo "| Container | Version |" >> $GITHUB_STEP_SUMMARY
-          echo "|:-|:-|" >> $GITHUB_STEP_SUMMARY
-          # 新增：容错处理
-          supervisor_version=$(jq -r ".supervisor" output/build/hassio-*/version.json 2>/dev/null || echo "unknown")
-          landingpage_version=$(curl -fsSL https://api.github.com/repos/home-assistant/landingpage/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "unknown")
-          echo "| supervisor | [${supervisor_version}](https://github.com/home-assistant/supervisor/releases/tag/${supervisor_version}) |" >> $GITHUB_STEP_SUMMARY
-          echo "| landingpage | [${landingpage_version}](https://github.com/home-assistant/landingpage/releases/tag/${landingpage_version}) |" >> $GITHUB_STEP_SUMMARY
-          for plugin in dns audio cli multicast observer; do
-            version=$(jq -r ".${plugin}" output/build/hassio-*/version.json 2>/dev/null || echo "unknown")
-            echo "| plugin-${plugin} | [${version}](https://github.com/home-assistant/plugin-${plugin}/releases/tag/${version}) |" >> $GITHUB_STEP_SUMMARY
-          done
+          echo "# ${{ matrix.board.id }} Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Basic Info" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.prepare.outputs.version_full }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Channel: ${{ needs.prepare.outputs.channel }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Hass.io Channel: ${{ needs.prepare.outputs.hassio_channel_option }}" >> $GITHUB_STEP_SUMMARY
+          
           echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "| File | Size (bytes) | Size (formatted) |" >> $GITHUB_STEP_SUMMARY
-          echo "|:-|:-|:-|" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size (bytes) | Size (human) |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------------|--------------|" >> $GITHUB_STEP_SUMMARY
           for f in output/images/haos_*; do
-            if [ -f "$f" ]; then  # 新增：文件存在性检查
-              echo "| $(basename $f) | $(du -b $f | cut -f1) | $(du -bh $f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
-          echo "## Partitions" >> $GITHUB_STEP_SUMMARY
-          echo "| File | Size (bytes) | Size (formatted) |" >> $GITHUB_STEP_SUMMARY
-          echo "|:-|:-|:-|" >> $GITHUB_STEP_SUMMARY
-          for f in boot.vfat kernel.img rootfs.erofs overlay.ext4 data.ext4; do
-            if [ -f "output/images/$f" ]; then  # 新增：文件存在性检查
-              echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+            if [ -f "$f" ]; then
+              size_bytes=$(du -b "$f" | cut -f1)
+              size_human=$(du -bh "$f" | cut -f1)
+              echo "| $(basename "$f") | $size_bytes | $size_human |" >> $GITHUB_STEP_SUMMARY
             fi
           done
 
-      - name: Upload OS image artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+          name: haos-${{ needs.prepare.outputs.version_full }}-${{ matrix.board.id }}
           path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-          retention-days: 7  # 新增：Artifact保留期
-
-      - name: Upload RAUC bundle artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' }}
-        with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-          retention-days: 7  # 新增：Artifact保留期
-
-      - name: Upload Open Virtualization Format (OVA) artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
-        with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
-          retention-days: 7  # 新增：Artifact保留期
-
-      - name: Upload QEMU disk image artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
-        with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
-          retention-days: 7  # 新增：Artifact保留期
-
-      - name: Upload VMware Virtual Machine Disk (VMDK) artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
-        with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
-          retention-days: 7  # 新增：Artifact保留期
-
-      - name: Upload VirtualBox Virtual Disk Image (VDI) artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
-        with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
-          retention-days: 7  # 新增：Artifact保留期
-
-      - name: Upload Virtual Hard Disk v2 (VHDX) artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
-        with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
-          retention-days: 7  # 新增：Artifact保留期
+            output/images/haos_*
+            output/.config
+            buildroot-external/meta
+          retention-days: 7
+          if-no-files-found: warn
