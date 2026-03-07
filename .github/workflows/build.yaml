@@ -42,7 +42,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      packages: read  # 仅保留read，移除write权限
+      packages: read
     outputs:
       version_dev: ${{ steps.version_dev.outputs.version_dev }}
       version_main: ${{ steps.version.outputs.version_main }}
@@ -50,7 +50,7 @@ jobs:
       channel: ${{ steps.channel.outputs.channel }}
       hassio_channel_option: ${{ steps.channel.outputs.hassio_channel_option }}
       matrix: ${{ steps.generate_matrix.outputs.result }}
-      build_container_image: haos-builder:local  # 改为本地镜像名，不依赖GHCR
+      build_container_image: haos-builder:local
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
     steps:
@@ -174,18 +174,30 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      # 移除：GHCR登录步骤
-      # 移除：Build and Push（GHCR推送）步骤 → 替换为本地构建镜像
       - name: Build local haos-builder image (不推送GHCR)
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         id: build_haos_builder
         with:
           context: .
           file: Dockerfile
-          tags: haos-builder:local  # 本地标签，不推送到仓库
+          tags: haos-builder:local
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
-          push: false  # 关键：禁用推送
+          push: false
+
+      # 新增：将本地镜像保存为tar包，作为artifact上传
+      - name: Save haos-builder image to tar
+        run: |
+          docker save haos-builder:local -o haos-builder.tar
+          ls -lh haos-builder.tar
+
+      # 新增：上传镜像tar包到Actions Artifact
+      - name: Upload haos-builder image artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: haos-builder-image
+          path: haos-builder.tar
+          retention-days: 1  # 仅保留1天，节省空间
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -210,7 +222,7 @@ jobs:
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
-      contents: write  # for actions/upload-release-asset to upload release asset
+      contents: write
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
@@ -223,6 +235,19 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+
+      # 新增：下载haos-builder镜像tar包
+      - name: Download haos-builder image artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: haos-builder-image
+          path: .
+
+      # 新增：加载本地镜像到Docker
+      - name: Load haos-builder image into Docker
+        run: |
+          docker load -i haos-builder.tar
+          docker images | grep haos-builder  # 验证镜像是否加载成功
 
       - name: Setup Python version ${{ env.PYTHON_VERSION }}
         if: ${{ github.event_name != 'release' }}
@@ -281,7 +306,7 @@ jobs:
       - name: Generate build config
         uses: "./.github/actions/haos-builder-command"
         with:
-          image: ${{ needs.prepare.outputs.build_container_image }}  # 使用本地镜像
+          image: ${{ needs.prepare.outputs.build_container_image }}
           command: make ${{ matrix.board.defconfig }}_defconfig
 
       - name: Override release channel
@@ -369,7 +394,6 @@ jobs:
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
 
-      # 以下所有上传构建产物的步骤保持不变（仅上传到Actions，不上传到GHCR/R2）
       - name: Upload OS image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
@@ -396,7 +420,6 @@ jobs:
 
       - name: Upload QEMU disk image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        # Create artifact for ova every time - it's used by the called tests workflow
         if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
