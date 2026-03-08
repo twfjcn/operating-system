@@ -25,16 +25,15 @@ on:
         description: 'Release channel to use (default: stable for GH releases, dev otherwise)'
         type: choice
         required: true
-        default: stable  # 修改默认值为stable
+        default: stable
         options:
-          - stable  # 提升stable优先级
+          - stable
           - beta
           - dev
-          - default  # 移到最后
+          - default
 
 env:
   PYTHON_VERSION: "3.13"
-  # 使用官方预构建的haos-builder镜像
   BUILDER_IMAGE: "ghcr.io/home-assistant/haos-builder:latest"
 
 jobs:
@@ -75,6 +74,7 @@ jobs:
           else
             echo "publish_build=false" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Generate development version
         shell: bash
         id: version_dev
@@ -88,12 +88,14 @@ jobs:
           fi
           echo "Development version \"${version_dev}\""
           echo "version_dev=${version_dev}" >> $GITHUB_OUTPUT
+
       - name: Set version suffix
         if: ${{ github.event_name != 'release' }}
         env:
           VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
         run: |
           sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+
       - name: Get version
         id: version
         run: |
@@ -106,6 +108,7 @@ jobs:
           fi
           echo "version_full=${version_full}" >> $GITHUB_OUTPUT
           echo "Full version number of this release is \"${version_full}\"."
+
       - name: Validate version
         id: version_check
         if: ${{ github.event_name == 'release' }}
@@ -114,35 +117,15 @@ jobs:
             echo "Version number in Buildroot metadata does not match tag (${{ steps.version.outputs.version_full }} vs ${{ github.event.release.tag_name }})."
             exit 1
           fi
-      - name: Get channel
+
+      - name: Get channel (强制使用stable通道)
         id: channel
         run: |
-          # 强制所有场景使用stable通道（核心修改1）
+          # 强制所有场景使用stable通道
           echo "channel=stable" >> "$GITHUB_OUTPUT"
-          # 强制使用stable源（核心修改2）
+          # 强制使用stable源（关键修改）
           echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
-          
-          # 保留原有逻辑但作为备选（如需灵活控制可注释上面两行，启用下面逻辑）
-          # if [[ "${{ github.event_name }}" == "release" ]]; then
-          #   if [[ "${{ github.event.release.prerelease }}" == "true" ]]; then
-          #     echo "channel=beta" >> "$GITHUB_OUTPUT"
-          #   else
-          #     echo "channel=stable" >> "$GITHUB_OUTPUT"
-          #   fi
-          # else
-          #   echo "channel=dev" >> "$GITHUB_OUTPUT"
-          # fi
-          # if [[ "${{ inputs.hassio_channel }}" == "default" ]]; then
-          #   echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
-          # else
-          #   if [[ "${{ inputs.hassio_channel }}" == "stable" ]]; then
-          #     echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
-          #   elif [[ "${{ inputs.hassio_channel }}" == "beta" ]]; then
-          #     echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT"
-          #   elif [[ "${{ inputs.hassio_channel }}" == "dev" ]]; then
-          #     echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
-          #   fi
-          # fi
+
       - name: Create build matrix
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         id: generate_matrix
@@ -160,7 +143,6 @@ jobs:
             } else {
               console.log("Run partial build")
               const boardSet = new Set(boardFilter.split(","))
-              // if tests are enabled, we need to ensure the OVA board is included
               if (runTests && !boardSet.has("ova")) {
                 console.log("Adding OVA board for integration tests")
                 boardSet.add("ova")
@@ -168,11 +150,12 @@ jobs:
               const buildBoards = boards.filter(b => boardSet.has(b.id))
               return { "board": buildBoards }
             }
-      # 直接拉取官方镜像，无需本地构建
+
       - name: Pull official haos-builder image
         run: |
           docker pull ${{ env.BUILDER_IMAGE }}
           docker images | grep haos-builder
+
       - name: Generate self-signed certificate
         id: generate_signing_key
         env:
@@ -183,6 +166,7 @@ jobs:
           echo "::warning:: RAUC certificate or key is missing in the repository secrets. Building with a public self-signed certificate!"
           buildroot-external/scripts/generate-signing-key.sh cert.pem key.pem
           echo "self_signed_cert=true" >> $GITHUB_OUTPUT
+
       - name: Create signing key
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: steps.generate_signing_key.outcome == 'success'
@@ -191,6 +175,7 @@ jobs:
           path: |
             cert.pem
             key.pem
+
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
@@ -208,11 +193,11 @@ jobs:
           submodules: true
           persist-credentials: false
 
-      # 拉取官方镜像（确保build阶段也有）
       - name: Pull official haos-builder image
         run: |
           docker pull ${{ env.BUILDER_IMAGE }}
           docker images | grep haos-builder
+
       - name: Setup Python version ${{ env.PYTHON_VERSION }}
         if: ${{ github.event_name != 'release' }}
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -229,6 +214,7 @@ jobs:
           VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
         run: |
           sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+
       - name: 'Add release PKI certs'
         if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
         env:
@@ -237,6 +223,7 @@ jobs:
         run: |
           echo "${RAUC_CERTIFICATE}" > cert.pem
           echo "${RAUC_PRIVATE_KEY}" > key.pem
+
       - name: Get self-signed certificate from the prepare job
         if: ${{ needs.prepare.outputs.self_signed_cert == 'true' }}
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -255,6 +242,7 @@ jobs:
           sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
           sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
           df -h
+
       - name: "Restore cache: object files"
         uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
@@ -267,13 +255,14 @@ jobs:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: make ${{ matrix.board.defconfig }}_defconfig
 
-      - name: Override release channel
-        if: ${{ needs.prepare.outputs.hassio_channel_option != 'BR2_PACKAGE_HASSIO_CHANNEL_STABLE' }}
+      - name: Force stable channel (关键修改)
+        # 强制覆盖为stable通道，无论输入参数如何
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: |
-            bash -c 'echo "${{ needs.prepare.outputs.hassio_channel_option }}=y" >> /build/output/.config && make olddefconfig'
+            bash -c 'echo "BR2_PACKAGE_HASSIO_CHANNEL_STABLE=y" >> /build/output/.config && make olddefconfig'
+
       - name: Build
         uses: "./.github/actions/haos-builder-command"
         with:
@@ -286,6 +275,7 @@ jobs:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: |
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
+
       - name: Upload artifacts to R2 (禁用)
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
         working-directory: output/images/
@@ -300,39 +290,39 @@ jobs:
             --include "haos_*" \
             --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
       
-      # ========== 修复Release上传逻辑 ==========
-      - name: List build artifacts (调试用)
+      # ========== 核心修改：可靠的Release上传逻辑 ==========
+      - name: Verify build artifacts exist
         if: ${{ github.event_name == 'release' }}
         run: |
-          echo "=== Build artifacts list ==="
+          # 检查关键文件是否存在，不存在则构建失败
+          IMG_FILE="output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz"
+          RAUCB_FILE="output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb"
+          
+          if [ ! -f "$IMG_FILE" ]; then
+            echo "Error: $IMG_FILE does not exist!"
+            ls -la output/images/
+            exit 1
+          fi
+          
+          if [ ! -f "$RAUCB_FILE" ]; then
+            echo "Error: $RAUCB_FILE does not exist!"
+            ls -la output/images/
+            exit 1
+          fi
+          
+          echo "✅ All required artifacts exist"
           ls -la output/images/
-          echo "============================"
           
-      - name: Upload img.xz to release (修复版)
+      - name: Upload artifacts to GitHub Release
         if: ${{ github.event_name == 'release' }}
         uses: softprops/action-gh-release@v2
         with:
-          files: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Upload raucb to release (修复版)
-        if: ${{ github.event_name == 'release' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      # 保留原有通用上传逻辑（上传其他haos_*文件）
-      - name: Upload other release assets
-        if: ${{ github.event_name == 'release' }}
-        uses: softprops/action-gh-release@v2
-        with:
+          # 明确指定要上传的文件，避免重复上传
           files: |
-            output/images/haos_*
-            !output/images/haos_*.img.xz
-            !output/images/haos_*.raucb
+            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
+          # 避免重复上传时的冲突
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -343,12 +333,6 @@ jobs:
           echo "Old files to remove: $(find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile | wc -l)"
           find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile -delete
           echo "Cache size after pruning: $(du -sh /mnt/cache/cc)"
-      - name: "Save cache: object files"
-        if: github.ref == 'refs/heads/dev'
-        uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-        with:
-          path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}-${{ github.run_id }}
 
       - name: Generate build summary
         run: |
@@ -377,7 +361,8 @@ jobs:
           for f in boot.vfat kernel.img rootfs.erofs overlay.ext4 data.ext4; do
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
-      # 所有产物上传步骤保持不变
+
+      # 保留原有Artifacts上传逻辑（非Release场景）
       - name: Upload OS image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
@@ -385,6 +370,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+
       - name: Upload RAUC bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' }}
@@ -392,6 +378,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
+
       - name: Upload Open Virtualization Format (OVA) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
@@ -399,6 +386,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
+
       - name: Upload QEMU disk image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
@@ -406,6 +394,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
+
       - name: Upload VMware Virtual Machine Disk (VMDK) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
@@ -413,6 +402,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
+
       - name: Upload VirtualBox Virtual Disk Image (VDI) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
@@ -420,6 +410,7 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
+
       - name: Upload Virtual Hard Disk v2 (VHDX) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
@@ -427,3 +418,10 @@ jobs:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
+
+      - name: "Save cache: object files"
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        with:
+          path: /mnt/cache/cc
+          key: haos-cc-${{ matrix.board.id }}-${{ github.run_id }}
