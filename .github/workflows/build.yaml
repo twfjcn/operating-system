@@ -308,7 +308,7 @@ jobs:
             echo "::warning:: R2 credentials not found, skipping R2 upload"
           fi
       
-      # ========== 核心修改：统一的Release上传逻辑 ==========
+      # ========== 核心修改：修复Release上传逻辑 ==========
       - name: Get Release Upload URL
         id: get_release_url
         if: ${{ needs.prepare.outputs.publish_build == 'true' }}
@@ -347,38 +347,54 @@ jobs:
           draft: false
           prerelease: false
 
-      # 上传所有ZIP压缩文件到Release
-      - name: Upload ZIP files to Release
+      # 列出所有要上传的文件并生成上传命令
+      - name: Generate upload commands
+        id: generate_upload_commands
         if: ${{ needs.prepare.outputs.publish_build == 'true' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
-        with:
-          upload_url: ${{ steps.get_release_url.outputs.upload_url != 'create_new' && steps.get_release_url.outputs.upload_url || steps.create_release.outputs.upload_url }}
-          asset_path: output/images/*.zip
-          asset_name: ${{ matrix.board.id }}_{{ needs.prepare.outputs.version_full }}_{{ github.run_id }}_{{ basename(file) }}
-          asset_content_type: application/zip
-
-      # 上传所有RAUC文件到Release
-      - name: Upload RAUC files to Release
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
-        with:
-          upload_url: ${{ steps.get_release_url.outputs.upload_url != 'create_new' && steps.get_release_url.outputs.upload_url || steps.create_release.outputs.upload_url }}
-          asset_path: output/images/*.raucb
-          asset_name: ${{ matrix.board.id }}_{{ needs.prepare.outputs.version_full }}_{{ github.run_id }}.raucb
-          asset_content_type: application/octet-stream
-
-      # 上传其他镜像文件（保持原有逻辑）
-      - name: Upload other image files to Release
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
-        with:
-          upload_url: ${{ steps.get_release_url.outputs.upload_url != 'create_new' && steps.get_release_url.outputs.upload_url || steps.create_release.outputs.upload_url }}
-          asset_path: |
-            output/images/haos_*.img.xz
-            output/images/haos_*.qcow2.xz
-            output/images/haos_*.ova
-          asset_name: ${{ matrix.board.id }}_haos_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}_${{ basename(file) }}
-          asset_content_type: application/octet-stream
+        run: |
+          # 切换到输出目录
+          cd output/images
+          
+          # 生成ZIP文件上传命令
+          ZIP_FILES=$(ls *.zip 2>/dev/null)
+          if [ -n "$ZIP_FILES" ]; then
+            for file in $ZIP_FILES; do
+              echo "::warning:: Found ZIP file: $file"
+              # 上传每个ZIP文件
+              gh release upload ${{ needs.prepare.outputs.version_full }} "$file" \
+                --repo ${{ github.repository }} \
+                --clobber \
+                --name "${{ matrix.board.id }}_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}_$file"
+            done
+          fi
+          
+          # 生成RAUC文件上传命令
+          RAUC_FILES=$(ls *.raucb 2>/dev/null)
+          if [ -n "$RAUC_FILES" ]; then
+            for file in $RAUC_FILES; do
+              echo "::warning:: Found RAUC file: $file"
+              # 上传每个RAUC文件
+              gh release upload ${{ needs.prepare.outputs.version_full }} "$file" \
+                --repo ${{ github.repository }} \
+                --clobber \
+                --name "${{ matrix.board.id }}_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}.raucb"
+            done
+          fi
+          
+          # 生成其他镜像文件上传命令
+          OTHER_FILES=$(ls haos_*.img.xz haos_*.qcow2.xz haos_*.ova 2>/dev/null)
+          if [ -n "$OTHER_FILES" ]; then
+            for file in $OTHER_FILES; do
+              echo "::warning:: Found image file: $file"
+              # 上传其他镜像文件
+              gh release upload ${{ needs.prepare.outputs.version_full }} "$file" \
+                --repo ${{ github.repository }} \
+                --clobber \
+                --name "${{ matrix.board.id }}_haos_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}_$file"
+            done
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ========== 原有步骤保留 ==========
       - name: Print cache stats
