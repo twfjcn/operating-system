@@ -165,45 +165,71 @@ jobs:
               ;;
           esac
       
+      # 修复核心：Matrix生成逻辑（确保始终输出有效JSON）
       - name: Create build matrix
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         id: generate_matrix
         with:
           script: |
-            // 修复matrix.json解析逻辑
+            // 1. 定义默认board配置（兜底方案）
+            const defaultBoards = [
+              {id: 'panther-x2', defconfig: 'panther-x2'}
+            ];
+            
+            // 2. 尝试读取matrix.json，失败则使用默认配置
             let boards = [];
             try {
-              boards = require('./.github/workflows/matrix.json');
-              // 确保boards是数组格式
-              if (!Array.isArray(boards)) {
-                boards = Object.values(boards).flat();
+              const matrixFile = require('./.github/workflows/matrix.json');
+              // 兼容不同格式的matrix.json
+              if (Array.isArray(matrixFile)) {
+                boards = matrixFile;
+              } else if (typeof matrixFile === 'object' && matrixFile.boards) {
+                boards = matrixFile.boards;
+              } else {
+                boards = Object.values(matrixFile).flat();
               }
+              // 验证board配置格式
+              boards = boards.filter(b => b.id && b.defconfig);
             } catch (e) {
-              console.log('Using default board list due to matrix.json error:', e.message);
-              boards = [{id: 'panther-x2', defconfig: 'panther-x2'}];
+              console.log('Matrix file error, using default boards:', e.message);
+              boards = defaultBoards;
             }
             
-            if ("${{ github.event_name }}" == "release") {
-              core.setOutput('result', { "board": boards });
-              return;
+            // 3. 确保boards不为空
+            if (boards.length === 0) {
+              console.log('No valid boards found, using default panther-x2');
+              boards = defaultBoards;
             }
             
-            const boardFilter = "${{ github.event.inputs.boards }}".split(',').map(b => b.trim()).filter(Boolean);
-            const runTests = "${{ github.event.inputs.run_tests }}" === "true";
-            
-            if (boardFilter.length === 0) {
-              console.log("Run full build for all boards");
-              core.setOutput('result', { "board": boards });
-            } else {
-              console.log("Run partial build for boards:", boardFilter);
-              if (runTests && !boardFilter.includes("ova")) {
-                console.log("Adding OVA board for integration tests");
-                boardFilter.push("ova");
+            // 4. 处理手动触发的board过滤
+            let buildBoards = boards;
+            if ("${{ github.event_name }}" !== "release") {
+              const boardFilter = "${{ github.event.inputs.boards }}"
+                .split(',')
+                .map(b => b.trim())
+                .filter(Boolean);
+              const runTests = "${{ github.event.inputs.run_tests }}" === "true";
+              
+              if (boardFilter.length > 0) {
+                // 过滤匹配的boards
+                buildBoards = boards.filter(b => boardFilter.includes(b.id));
+                // 测试模式自动添加ova
+                if (runTests && !buildBoards.some(b => b.id === 'ova')) {
+                  const ovaBoard = boards.find(b => b.id === 'ova') || {id: 'ova', defconfig: 'ova'};
+                  buildBoards.push(ovaBoard);
+                }
               }
-              // 过滤匹配的board配置
-              const buildBoards = boards.filter(b => boardFilter.includes(b.id));
-              core.setOutput('result', { "board": buildBoards.length > 0 ? buildBoards : boards });
             }
+            
+            // 5. 最终兜底：确保输出有效
+            if (buildBoards.length === 0) {
+              buildBoards = defaultBoards;
+            }
+            
+            // 6. 输出标准JSON格式（关键：确保非空）
+            const result = { "board": buildBoards };
+            console.log('Final build matrix:', JSON.stringify(result, null, 2));
+            core.setOutput('result', JSON.stringify(result));
       
       - name: Pull official haos-builder image
         run: |
@@ -218,6 +244,18 @@ jobs:
         if: env.RAUC_CERTIFICATE == '' || env.RAUC_PRIVATE_KEY == ''
         run: |
           echo "::warning:: RAUC certificate or key is missing in the repository secrets. Building with a public self-signed certificate!"
+          # 确保脚本存在，不存在则创建简易版本
+          if [ ! -f "buildroot-external/scripts/generate-signing-key.sh" ]; then
+            mkdir -p buildroot-external/scripts
+            cat > buildroot-external/scripts/generate-signing-key.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          CERT=$1
+          KEY=$2
+          openssl req -x509 -newkey rsa:4096 -keyout $KEY -out $CERT -days 3650 -nodes -subj "/CN=HAOS Self-Signed"
+          EOF
+            chmod +x buildroot-external/scripts/generate-signing-key.sh
+          fi
           buildroot-external/scripts/generate-signing-key.sh cert.pem key.pem
           echo "self_signed_cert=true" >> $GITHUB_OUTPUT
       
@@ -237,7 +275,8 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      # 修复：确保fromJson始终有有效输入
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix || '{"board":[{"id":"panther-x2","defconfig":"panther-x2"}]}') }}
     runs-on: ubuntu-22.04
 
     steps:
