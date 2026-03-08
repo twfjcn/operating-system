@@ -25,12 +25,12 @@ on:
         description: 'Release channel to use (default: stable for GH releases, dev otherwise)'
         type: choice
         required: true
-        default: default
+        default: stable  # 修改默认值为stable
         options:
-          - default
-          - stable
+          - stable  # 提升stable优先级
           - beta
           - dev
+          - default  # 移到最后
 
 env:
   PYTHON_VERSION: "3.13"
@@ -117,30 +117,32 @@ jobs:
       - name: Get channel
         id: channel
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            if [[ "${{ github.event.release.prerelease }}" == "true" ]]; then
-              echo "channel=beta" >> "$GITHUB_OUTPUT"
-            else
-              echo "channel=stable" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "channel=dev" >> "$GITHUB_OUTPUT"
-          fi
-          if [[ "${{ inputs.hassio_channel }}" == "default" ]]; then
-            if [[ "${{ github.event_name }}" == "release" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
-            else
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            if [[ "${{ inputs.hassio_channel }}" == "stable" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
-            elif [[ "${{ inputs.hassio_channel }}" == "beta" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT"
-            elif [[ "${{ inputs.hassio_channel }}" == "dev" ]]; then
-              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+          # 强制所有场景使用stable通道（核心修改1）
+          echo "channel=stable" >> "$GITHUB_OUTPUT"
+          # 强制使用stable源（核心修改2）
+          echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+          
+          # 保留原有逻辑但作为备选（如需灵活控制可注释上面两行，启用下面逻辑）
+          # if [[ "${{ github.event_name }}" == "release" ]]; then
+          #   if [[ "${{ github.event.release.prerelease }}" == "true" ]]; then
+          #     echo "channel=beta" >> "$GITHUB_OUTPUT"
+          #   else
+          #     echo "channel=stable" >> "$GITHUB_OUTPUT"
+          #   fi
+          # else
+          #   echo "channel=dev" >> "$GITHUB_OUTPUT"
+          # fi
+          # if [[ "${{ inputs.hassio_channel }}" == "default" ]]; then
+          #   echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+          # else
+          #   if [[ "${{ inputs.hassio_channel }}" == "stable" ]]; then
+          #     echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+          #   elif [[ "${{ inputs.hassio_channel }}" == "beta" ]]; then
+          #     echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT"
+          #   elif [[ "${{ inputs.hassio_channel }}" == "dev" ]]; then
+          #     echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
+          #   fi
+          # fi
       - name: Create build matrix
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         id: generate_matrix
@@ -192,7 +194,7 @@ jobs:
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
-      contents: write
+      contents: write  # 确保有写入release的权限
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
@@ -298,35 +300,41 @@ jobs:
             --include "haos_*" \
             --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
       
-      # ========== 修改部分开始 ==========
-      # 扩展Release上传逻辑，包含img.xz和raucb文件
-      - name: Upload img.xz to release
-        if: ${{ github.event_name == 'release' && matrix.board.id != 'ova' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-          asset_name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-          asset_content_type: application/x-xz
-          
-      - name: Upload raucb to release
+      # ========== 修复Release上传逻辑 ==========
+      - name: List build artifacts (调试用)
         if: ${{ github.event_name == 'release' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+        run: |
+          echo "=== Build artifacts list ==="
+          ls -la output/images/
+          echo "============================"
+          
+      - name: Upload img.xz to release (修复版)
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-          asset_name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-          asset_content_type: application/octet-stream
+          files: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Upload raucb to release (修复版)
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
       # 保留原有通用上传逻辑（上传其他haos_*文件）
       - name: Upload other release assets
         if: ${{ github.event_name == 'release' }}
-        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: output/images/haos_*
-          asset_content_type: application/octet-stream
-      # ========== 修改部分结束 ==========
+          files: |
+            output/images/haos_*
+            !output/images/haos_*.img.xz
+            !output/images/haos_*.raucb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Print cache stats
         run: |
