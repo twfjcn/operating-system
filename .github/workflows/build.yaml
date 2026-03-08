@@ -15,7 +15,7 @@ on:
         description: 'Publish build artifacts to R2 (not applicable to forks)'
         required: true
         type: boolean
-        default: true  # 默认改为true，确保上传到Release
+        default: false
       run_tests:
         description: 'Run tests after build'
         required: true
@@ -25,7 +25,7 @@ on:
         description: 'Release channel to use (default: stable for GH releases, dev otherwise)'
         type: choice
         required: true
-        default: stable  # 默认使用稳定版
+        default: default
         options:
           - default
           - stable
@@ -55,25 +55,12 @@ jobs:
       build_container_image: ${{ env.BUILDER_IMAGE }}
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
-      official_version: ${{ steps.get_official_version.outputs.official_version }}
     steps:
       - name: Checkout source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      # 新增步骤：获取Home Assistant官方最新稳定版本
-      - name: Get official Home Assistant stable version
-        id: get_official_version
-        run: |
-          # 获取HA官方最新稳定版本
-          OFFICIAL_VERSION=$(curl -s "https://api.github.com/repos/home-assistant/core/releases/latest" | jq -r '.tag_name' | sed 's/^//')
-          # 如果获取失败，使用备用API
-          if [ "$OFFICIAL_VERSION" == "null" ] || [ -z "$OFFICIAL_VERSION" ]; then
-            OFFICIAL_VERSION=$(curl -s "https://version.home-assistant.io/stable.json" | jq -r '.core')
-          fi
-          echo "Official Home Assistant stable version: $OFFICIAL_VERSION"
-          echo "official_version=$OFFICIAL_VERSION" >> $GITHUB_OUTPUT
       - name: Check if build should be published
         id: check_publish
         env:
@@ -86,8 +73,7 @@ jobs:
               echo "publish_build=true" >> "$GITHUB_OUTPUT"
             fi
           else
-            # 非官方仓库也允许发布到Release
-            echo "publish_build=${PUBLISH_FLAG}" >> "$GITHUB_OUTPUT"
+            echo "publish_build=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Generate development version
         shell: bash
@@ -95,11 +81,12 @@ jobs:
         if: ${{ github.event_name != 'release' }}
         env:
           PUBLISH_BUILD: ${{ steps.check_publish.outputs.publish_build }}
-          OFFICIAL_VERSION: ${{ steps.get_official_version.outputs.official_version }}
         run: |
-          # 使用官方稳定版本作为基础版本
-          version_dev="${OFFICIAL_VERSION}"
-          echo "Using official stable version \"${version_dev}\""
+          version_dev="dev$(date --utc +'%Y%m%d')"
+          if [ "${{ env.PUBLISH_BUILD }}" != "true" ] || [ "${{ github.ref }}" != "refs/heads/dev" ]; then
+            version_dev="dev$(date +%s)"
+          fi
+          echo "Development version \"${version_dev}\""
           echo "version_dev=${version_dev}" >> $GITHUB_OUTPUT
       - name: Set version suffix
         if: ${{ github.event_name != 'release' }}
@@ -107,30 +94,18 @@ jobs:
           VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
         run: |
           sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
-          # 同时设置主版本号为官方版本
-          sed -i -E "s/(^VERSION_MAJOR=\").*(\"$)/\1$(echo ${VERSION_DEV} | cut -d. -f1)\2/" buildroot-external/meta
-          sed -i -E "s/(^VERSION_MINOR=\").*(\"$)/\1$(echo ${VERSION_DEV} | cut -d. -f2)\2/" buildroot-external/meta
       - name: Get version
         id: version
-        env:
-          OFFICIAL_VERSION: ${{ steps.get_official_version.outputs.official_version }}
         run: |
           . ${GITHUB_WORKSPACE}/buildroot-external/meta
-          # 使用官方版本作为主版本
-          if [ -n "${{ steps.get_official_version.outputs.official_version }}" ]; then
-            version_main="${{ steps.get_official_version.outputs.official_version }}"
-          else
-            version_main="${VERSION_MAJOR}.${VERSION_MINOR}"
-          fi
-          echo "version_main=${version_main}" >> $GITHUB_OUTPUT
-          
+          echo "version_main=${VERSION_MAJOR}.${VERSION_MINOR}" >> $GITHUB_OUTPUT
           if [ -z "${VERSION_SUFFIX}" ]; then
-            version_full="${version_main}"
+            version_full="${VERSION_MAJOR}.${VERSION_MINOR}"
           else
-            version_full="${version_main}"
+            version_full="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_SUFFIX}"
           fi
           echo "version_full=${version_full}" >> $GITHUB_OUTPUT
-          echo "Full version number of this release is \"${version_full}\" (official stable version)."
+          echo "Full version number of this release is \"${version_full}\"."
       - name: Validate version
         id: version_check
         if: ${{ github.event_name == 'release' }}
@@ -142,9 +117,30 @@ jobs:
       - name: Get channel
         id: channel
         run: |
-          # 强制使用stable通道
-          echo "channel=stable" >> "$GITHUB_OUTPUT"
-          echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            if [[ "${{ github.event.release.prerelease }}" == "true" ]]; then
+              echo "channel=beta" >> "$GITHUB_OUTPUT"
+            else
+              echo "channel=stable" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "${{ inputs.hassio_channel }}" == "default" ]]; then
+            if [[ "${{ github.event_name }}" == "release" ]]; then
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+            else
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            if [[ "${{ inputs.hassio_channel }}" == "stable" ]]; then
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_STABLE" >> "$GITHUB_OUTPUT"
+            elif [[ "${{ inputs.hassio_channel }}" == "beta" ]]; then
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_BETA" >> "$GITHUB_OUTPUT"
+            elif [[ "${{ inputs.hassio_channel }}" == "dev" ]]; then
+              echo "hassio_channel_option=BR2_PACKAGE_HASSIO_CHANNEL_DEV" >> "$GITHUB_OUTPUT"
+            fi
+          fi
       - name: Create build matrix
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         id: generate_matrix
@@ -170,6 +166,7 @@ jobs:
               const buildBoards = boards.filter(b => boardSet.has(b.id))
               return { "board": buildBoards }
             }
+      # 直接拉取官方镜像，无需本地构建
       - name: Pull official haos-builder image
         run: |
           docker pull ${{ env.BUILDER_IMAGE }}
@@ -195,7 +192,7 @@ jobs:
   build:
     name: Build for ${{ matrix.board.id }}
     permissions:
-      contents: write  # 确保有写入Release的权限
+      contents: write
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
@@ -209,6 +206,7 @@ jobs:
           submodules: true
           persist-credentials: false
 
+      # 拉取官方镜像（确保build阶段也有）
       - name: Pull official haos-builder image
         run: |
           docker pull ${{ env.BUILDER_IMAGE }}
@@ -229,9 +227,6 @@ jobs:
           VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
         run: |
           sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
-          # 同步设置主版本号
-          sed -i -E "s/(^VERSION_MAJOR=\").*(\"$)/\1$(echo ${VERSION_DEV} | cut -d. -f1)\2/" buildroot-external/meta
-          sed -i -E "s/(^VERSION_MINOR=\").*(\"$)/\1$(echo ${VERSION_DEV} | cut -d. -f2)\2/" buildroot-external/meta
       - name: 'Add release PKI certs'
         if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
         env:
@@ -289,114 +284,50 @@ jobs:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: |
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
-      # 修改：上传到R2（可选）
-      - name: Upload artifacts to R2
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
+      - name: Upload artifacts to R2 (禁用)
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
         working-directory: output/images/
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_OS_ARTIFACTS_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_OS_ARTIFACTS_KEY }}
         run: |
-          if [ -n "${{ secrets.R2_OS_ARTIFACTS_ID }}" ] && [ -n "${{ secrets.R2_OS_ARTIFACTS_KEY }}" ]; then
-            aws s3 sync \
-              ./ \
-              s3://${{ secrets.R2_OS_ARTIFACTS_BUCKET }}/${{ needs.prepare.outputs.version_full }}/ \
-              --exclude "*" \
-              --include "haos_*" \
-              --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
-          else
-            echo "::warning:: R2 credentials not found, skipping R2 upload"
-          fi
+          aws s3 sync \
+            ./ \
+            s3://${{ secrets.R2_OS_ARTIFACTS_BUCKET }}/${{ needs.prepare.outputs.version_full }}/ \
+            --exclude "*" \
+            --include "haos_*" \
+            --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
       
-      # ========== 核心修改：修复Release上传逻辑 ==========
-      - name: Get Release Upload URL
-        id: get_release_url
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
-        run: |
-          # 优先使用已存在的Release
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "upload_url=${{ github.event.release.upload_url }}" >> $GITHUB_OUTPUT
-          else
-            # 检查是否已有同名Tag/Release
-            TAG_EXISTS=$(git ls-remote --tags origin ${{ needs.prepare.outputs.version_full }} | wc -l)
-            if [ $TAG_EXISTS -gt 0 ]; then
-              # 获取已有Release的upload_url
-              UPLOAD_URL=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ needs.prepare.outputs.version_full }}" \
-                | jq -r '.upload_url')
-              echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
-            else
-              echo "upload_url=create_new" >> $GITHUB_OUTPUT
-            fi
-          fi
-
-      # 创建新Release（仅当不存在时）
-      - name: Create Release
-        id: create_release
-        if: ${{ needs.prepare.outputs.publish_build == 'true' && steps.get_release_url.outputs.upload_url == 'create_new' }}
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # ========== 修改部分开始 ==========
+      # 扩展Release上传逻辑，包含img.xz和raucb文件
+      - name: Upload img.xz to release
+        if: ${{ github.event_name == 'release' && matrix.board.id != 'ova' }}
+        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
         with:
-          tag_name: ${{ needs.prepare.outputs.version_full }}
-          name: HAOS ${{ needs.prepare.outputs.version_full }} (Official Stable)
-          body: |
-            Home Assistant Operating System built with official stable version ${{ needs.prepare.outputs.official_version }}
-            - Target boards: ${{ github.event.inputs.boards }}
-            - Build timestamp: ${{ github.run_id }}
-          draft: false
-          prerelease: false
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+          asset_name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+          asset_content_type: application/x-xz
+          
+      - name: Upload raucb to release
+        if: ${{ github.event_name == 'release' }}
+        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
+          asset_name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
+          asset_content_type: application/octet-stream
+          
+      # 保留原有通用上传逻辑（上传其他haos_*文件）
+      - name: Upload other release assets
+        if: ${{ github.event_name == 'release' }}
+        uses: shogo82148/actions-upload-release-asset@8f6863c6c894ba46f9e676ef5cccec4752723c1e # v1.9.2
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: output/images/haos_*
+          asset_content_type: application/octet-stream
+      # ========== 修改部分结束 ==========
 
-      # 列出所有要上传的文件并生成上传命令
-      - name: Generate upload commands
-        id: generate_upload_commands
-        if: ${{ needs.prepare.outputs.publish_build == 'true' }}
-        run: |
-          # 切换到输出目录
-          cd output/images
-          
-          # 生成ZIP文件上传命令
-          ZIP_FILES=$(ls *.zip 2>/dev/null)
-          if [ -n "$ZIP_FILES" ]; then
-            for file in $ZIP_FILES; do
-              echo "::warning:: Found ZIP file: $file"
-              # 上传每个ZIP文件
-              gh release upload ${{ needs.prepare.outputs.version_full }} "$file" \
-                --repo ${{ github.repository }} \
-                --clobber \
-                --name "${{ matrix.board.id }}_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}_$file"
-            done
-          fi
-          
-          # 生成RAUC文件上传命令
-          RAUC_FILES=$(ls *.raucb 2>/dev/null)
-          if [ -n "$RAUC_FILES" ]; then
-            for file in $RAUC_FILES; do
-              echo "::warning:: Found RAUC file: $file"
-              # 上传每个RAUC文件
-              gh release upload ${{ needs.prepare.outputs.version_full }} "$file" \
-                --repo ${{ github.repository }} \
-                --clobber \
-                --name "${{ matrix.board.id }}_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}.raucb"
-            done
-          fi
-          
-          # 生成其他镜像文件上传命令
-          OTHER_FILES=$(ls haos_*.img.xz haos_*.qcow2.xz haos_*.ova 2>/dev/null)
-          if [ -n "$OTHER_FILES" ]; then
-            for file in $OTHER_FILES; do
-              echo "::warning:: Found image file: $file"
-              # 上传其他镜像文件
-              gh release upload ${{ needs.prepare.outputs.version_full }} "$file" \
-                --repo ${{ github.repository }} \
-                --clobber \
-                --name "${{ matrix.board.id }}_haos_${{ needs.prepare.outputs.version_full }}_${{ github.run_id }}_$file"
-            done
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ========== 原有步骤保留 ==========
       - name: Print cache stats
         run: |
           echo "Cache size: $(du -sh /mnt/cache/cc)"
@@ -415,7 +346,6 @@ jobs:
         run: |
           echo "# ${{ matrix.board.id }} build summary" >> $GITHUB_STEP_SUMMARY
           echo "## Built-in OS components" >> $GITHUB_STEP_SUMMARY
-          echo "Official HA version: ${{ needs.prepare.outputs.official_version }}" >> $GITHUB_STEP_SUMMARY
           echo "Release channel: ${{ inputs.hassio_channel }} (${{ needs.prepare.outputs.hassio_channel_option }})" >> $GITHUB_STEP_SUMMARY
           echo "| Container | Version |" >> $GITHUB_STEP_SUMMARY
           echo "|:-|:-|" >> $GITHUB_STEP_SUMMARY
@@ -437,56 +367,54 @@ jobs:
           echo "| File | Size (bytes) | Size (formatted) |" >> $GITHUB_STEP_SUMMARY
           echo "|:-|:-|:-|" >> $GITHUB_STEP_SUMMARY
           for f in boot.vfat kernel.img rootfs.erofs overlay.ext4 data.ext4; do
-            if [ -f "output/images/$f" ]; then
-              echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-            fi
+            echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
-      # 保留原有上传artifact的步骤（用于调试）
+      # 所有产物上传步骤保持不变
       - name: Upload OS image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
       - name: Upload RAUC bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ needs.prepare.outputs.publish_build != 'true' }}
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
       - name: Upload Open Virtualization Format (OVA) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
       - name: Upload QEMU disk image artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ matrix.board.id == 'ova' || (needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
+        if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
       - name: Upload VMware Virtual Machine Disk (VMDK) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
       - name: Upload VirtualBox Virtual Disk Image (VDI) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
       - name: Upload Virtual Hard Disk v2 (VHDX) artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        if: ${{ needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
+        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
         with:
           name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
           path: |
